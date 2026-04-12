@@ -1,0 +1,93 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+
+	"rdp_zero_trust/internal/proto"
+)
+
+func main() {
+	serverAddr := flag.String("server", "localhost:9000", "адрес control plane")
+	dataAddr := flag.String("data", "localhost:9001", "адрес data plane")
+	localAddr := flag.String("local", "localhost:13389", "локальный адрес для mstsc")
+	username := flag.String("user", "user1", "имя пользователя")
+	password := flag.String("pass", "secret", "пароль")
+	machineID := flag.String("machine", "machine1", "ID машины")
+	flag.Parse()
+
+	// Шаг 1: control plane — аутентификация и запрос машины
+	sessionID, err := authenticate(*serverAddr, *username, *password, *machineID)
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	log.Printf("сессия получена: %s", sessionID)
+
+	// Шаг 2: поднимаем локальный listener для mstsc
+	ln, err := net.Listen("tcp", *localAddr)
+	if err != nil {
+		log.Fatalf("local listen: %v", err)
+	}
+	log.Printf("слушаем на %s — открывай mstsc на этот адрес", *localAddr)
+
+	for {
+		local, err := ln.Accept()
+		if err != nil {
+			log.Printf("local accept: %v", err)
+			continue
+		}
+		go tunnel(local, *dataAddr, sessionID)
+	}
+}
+
+// authenticate подключается к control plane и получает адрес целевой машины
+func authenticate(serverAddr, username, password, machineID string) (string, error) {
+	raw, err := net.Dial("tcp", serverAddr)
+	if err != nil {
+		return "", err
+	}
+	// Намеренно не закрываем — держим сессию живой
+	// В продакшне это горутина с keepalive
+
+	c := proto.NewConn(raw)
+
+	// HELLO
+	c.Send(proto.MsgHello, username, password)
+	msgType, _, err := c.Recv()
+	if err != nil || msgType != proto.MsgOK {
+		return "", fmt.Errorf("hello rejected")
+	}
+
+	// CONNECT
+	c.Send(proto.MsgConnect, machineID)
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
+		return "", fmt.Errorf("connect rejected: %v", args)
+	}
+
+	return args[0], nil // адрес целевой машины
+}
+
+// tunnel: принимает соединение от mstsc, пробрасывает через data plane
+func tunnel(local net.Conn, dataAddr, sessionID string) {
+	defer local.Close()
+
+	// Подключаемся к data plane сервера
+	raw, err := net.Dial("tcp", dataAddr)
+	if err != nil {
+		log.Printf("tunnel: не могу подключиться к data plane: %v", err)
+		return
+	}
+	defer raw.Close()
+
+	// Говорим серверу куда проксировать
+	c := proto.NewConn(raw)
+	c.Send(proto.MsgSession, sessionID)
+
+	// Теперь просто гоним байты
+	go io.Copy(raw, local)
+	io.Copy(local, raw)
+}

@@ -1,0 +1,166 @@
+package main
+
+import (
+	"flag"
+	"io"
+	"log"
+	"net"
+
+	"rdp_zero_trust/internal/config"
+	"rdp_zero_trust/internal/proto"
+	"rdp_zero_trust/internal/session"
+)
+
+var (
+	cfg      *config.Config
+	sessions *session.Store
+)
+
+func main() {
+	controlAddr := flag.String("control", ":9000", "адрес control plane")
+	dataAddr := flag.String("data", ":9001", "адрес data plane")
+	configPath := flag.String("config", "config/config.json", "путь к конфигу")
+	flag.Parse()
+
+	// Запускаем оба листенера параллельно
+	var err error
+	cfg, err = config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
+
+	sessions = session.NewStore()
+
+	go listenControl(*controlAddr)
+	listenData(*dataAddr)
+}
+
+// listenControl — принимает управляющие соединения
+func listenControl(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("control listen: %v", err)
+	}
+	log.Printf("control plane слушает %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("control accept: %v", err)
+			continue
+		}
+		go handleControl(conn)
+	}
+}
+
+// handleControl — обрабатывает одного клиента на control plane
+func handleControl(raw net.Conn) {
+	c := proto.NewConn(raw)
+	defer c.Close()
+
+	log.Printf("новое control-соединение от %s", raw.RemoteAddr())
+
+	// Шаг 1: HELLO <username> <password>
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgHello || len(args) < 2 {
+		c.Send(proto.MsgError, "expected HELLO <username> <password>")
+		return
+	}
+	username, password := args[0], args[1]
+
+	if !cfg.Authenticate(username, password) {
+		c.Send(proto.MsgError, "invalid credentials")
+		log.Printf("[%s] неверный пароль", username)
+		return
+	}
+	log.Printf("[%s] аутентифицирован", username)
+	c.Send(proto.MsgOK)
+
+	// Шаг 2: CONNECT <machine_id>
+	msgType, args, err = c.Recv()
+	if err != nil || msgType != proto.MsgConnect || len(args) == 0 {
+		c.Send(proto.MsgError, "expected CONNECT <machine_id>")
+		return
+	}
+	machineID := args[0]
+
+	if !cfg.CanAccess(username, machineID) {
+		c.Send(proto.MsgError, "access denied")
+		log.Printf("[%s] нет доступа к %s", username, machineID)
+		return
+	}
+
+	targetAddr, ok := cfg.Machines[machineID]
+	if !ok {
+		c.Send(proto.MsgError, "unknown machine")
+		return
+	}
+
+	// Создаём сессию
+	sess, err := sessions.Create(username, machineID, targetAddr)
+	if err != nil {
+		c.Send(proto.MsgError, "internal error")
+		log.Printf("create session: %v", err)
+		return
+	}
+
+	log.Printf("[%s] сессия %s -> %s (%s)", username, sess.ID, machineID, targetAddr)
+	c.Send(proto.MsgOK, sess.ID)
+
+	// Держим control-соединение открытым — в будущем здесь будет TTL и сигналы
+	// Пока просто ждём закрытия
+	c.Recv()
+	sessions.Delete(sess.ID)
+	log.Printf("сессия %s завершена", sess.ID)
+}
+
+// listenData — принимает data-соединения и проксирует на целевую машину
+func listenData(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("data listen: %v", err)
+	}
+	log.Printf("data plane слушает %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("data accept: %v", err)
+			continue
+		}
+		go handleData(conn)
+	}
+}
+
+// handleData — первая строка от клиента: TARGET <адрес>
+func handleData(raw net.Conn) {
+	c := proto.NewConn(raw)
+	defer c.Close()
+
+	// Клиент предъявляет session_id
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
+		log.Printf("data: ожидал SESSION <id>")
+		return
+	}
+	sessionID := args[0]
+
+	sess, ok := sessions.Get(sessionID)
+	if !ok {
+		log.Printf("data: неизвестная сессия %s", sessionID)
+		return
+	}
+
+	log.Printf("data: сессия %s -> %s", sessionID, sess.TargetAddr)
+
+	target, err := net.Dial("tcp", sess.TargetAddr)
+	if err != nil {
+		log.Printf("data: не могу подключиться к %s: %v", sess.TargetAddr, err)
+		return
+	}
+	defer target.Close()
+
+	go io.Copy(target, raw)
+	io.Copy(raw, target)
+}

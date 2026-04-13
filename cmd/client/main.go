@@ -82,9 +82,25 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	}
 	defer raw.Close()
 
+	// Фаза 1: Handshake через текстовый протокол
 	c := proto.NewConn(raw)
+	// Отправляем запрос сессии
 	c.Send(proto.MsgSession, sessionID)
+	log.Printf("tunnel: отправлен SESSION %s", sessionID)
 
+	// ЖДЁМ ПОДТВЕРЖДЕНИЯ ОТ СЕРВЕРА перед началом передачи RDP данных
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgOK {
+		if msgType == proto.MsgError && len(args) > 0 {
+			log.Printf("tunnel: сервер отклонил: %s", args[0])
+		} else {
+			log.Printf("tunnel: ошибка handshake: %v", err)
+		}
+		return
+	}
+	log.Printf("tunnel: сессия подтверждена, начинаем передачу данных")
+
+	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
 	// Ждём завершения обоих направлений
 	done := make(chan struct{}, 2)
 
@@ -102,4 +118,5 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 
 	<-done
 	<-done
+	log.Printf("tunnel: сессия завершена")
 }

@@ -133,7 +133,7 @@ func listenData(addr string) {
 	}
 }
 
-// handleData — первая строка от клиента: TARGET <адрес>
+// handleData — первая строка от клиента: SESSION <id>
 func handleData(raw net.Conn) {
 	c := proto.NewConn(raw)
 	defer raw.Close()
@@ -141,6 +141,7 @@ func handleData(raw net.Conn) {
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
 		log.Printf("data: ожидал SESSION <id>")
+		c.Send(proto.MsgError, "invalid session request")
 		return
 	}
 	sessionID := args[0]
@@ -148,6 +149,7 @@ func handleData(raw net.Conn) {
 	sess, ok := sessions.Get(sessionID)
 	if !ok {
 		log.Printf("data: неизвестная сессия %s", sessionID)
+		c.Send(proto.MsgError, "session not found")
 		return
 	}
 
@@ -156,9 +158,13 @@ func handleData(raw net.Conn) {
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
 		log.Printf("data: не могу подключиться к %s: %v", sess.TargetAddr, err)
+		c.Send(proto.MsgError, "target connection failed")
 		return
 	}
 	defer target.Close()
+
+	// Отправляем подтверждение: сервер готов к передаче RDP данных
+	c.Send(proto.MsgOK)
 
 	done := make(chan struct{}, 2)
 

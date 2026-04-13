@@ -75,19 +75,31 @@ func authenticate(serverAddr, username, password, machineID string) (string, err
 func tunnel(local net.Conn, dataAddr, sessionID string) {
 	defer local.Close()
 
-	// Подключаемся к data plane сервера
 	raw, err := net.Dial("tcp", dataAddr)
 	if err != nil {
-		log.Printf("tunnel: не могу подключиться к data plane: %v", err)
+		log.Printf("tunnel: dial data plane: %v", err)
 		return
 	}
 	defer raw.Close()
 
-	// Говорим серверу куда проксировать
 	c := proto.NewConn(raw)
 	c.Send(proto.MsgSession, sessionID)
 
-	// Теперь просто гоним байты
-	go io.Copy(raw, local)
-	io.Copy(local, raw)
+	// Ждём завершения обоих направлений
+	done := make(chan struct{}, 2)
+
+	go func() {
+		io.Copy(raw, local)
+		raw.(*net.TCPConn).CloseWrite()
+		done <- struct{}{}
+	}()
+
+	go func() {
+		io.Copy(local, raw)
+		local.(*net.TCPConn).CloseWrite()
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
 }

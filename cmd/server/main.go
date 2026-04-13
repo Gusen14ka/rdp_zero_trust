@@ -136,9 +136,8 @@ func listenData(addr string) {
 // handleData — первая строка от клиента: TARGET <адрес>
 func handleData(raw net.Conn) {
 	c := proto.NewConn(raw)
-	defer c.Close()
+	defer raw.Close()
 
-	// Клиент предъявляет session_id
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
 		log.Printf("data: ожидал SESSION <id>")
@@ -161,6 +160,20 @@ func handleData(raw net.Conn) {
 	}
 	defer target.Close()
 
-	go io.Copy(target, raw)
-	io.Copy(raw, target)
+	done := make(chan struct{}, 2)
+
+	go func() {
+		io.Copy(target, raw)
+		target.(*net.TCPConn).CloseWrite()
+		done <- struct{}{}
+	}()
+
+	go func() {
+		io.Copy(raw, target)
+		raw.(*net.TCPConn).CloseWrite()
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
 }

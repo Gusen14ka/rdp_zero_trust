@@ -97,17 +97,11 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 
 	sessionID := args[0]
 
-	// Закрываем proto.Conn правильно (важно для TLS)
-	// Держим raw соединение (TLS) открытым для keepalive
-	// Примечание: raw.Close() вызывается через defer в основной функции
-	c = nil // не нужен больше, proto.Conn закроется через GC
-
+	// Держим proto.Conn открытым до закрытия контрольного соединения
 	go func() {
 		defer raw.Close()
-		buf := make([]byte, 1)
-		// Блокируемся до закрытия контрольного соединения сервером
-		raw.Read(buf)
-		log.Printf("control-соединение закрыто")
+		msgType, args, err := c.Recv()
+		log.Printf("control-соединение закрыто: msgType=%s args=%v err=%v", msgType, args, err)
 	}()
 
 	return sessionID, nil

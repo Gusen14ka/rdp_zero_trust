@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
@@ -70,7 +71,8 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	if err != nil {
 		return "", err
 	}
-	raw, err := tls.Dial("tcp", serverAddr, tlsCfg)
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	raw, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
 	if err != nil {
 		return "", fmt.Errorf("tls dial: %w", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"time"
 
 	"rdp_zero_trust/internal/config"
 	"rdp_zero_trust/internal/pipe"
@@ -50,19 +51,33 @@ func listenControl(addr string, certPath, keyPath string) {
 		MinVersion:   tls.VersionTLS13, // только TLS 1.3
 	}
 
-	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	tcpLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("control listen: %v", err)
 	}
 	log.Printf("control plane (TLS) слушает %s", addr)
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := tcpLn.Accept()
 		if err != nil {
 			log.Printf("control accept: %v", err)
 			continue
 		}
-		go handleControl(conn)
+
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
+		go func(raw net.Conn) {
+			defer raw.Close()
+			tlsConn := tls.Server(raw, tlsCfg)
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("control tls handshake: %v", err)
+				return
+			}
+			handleControl(tlsConn)
+		}(conn)
 	}
 }
 

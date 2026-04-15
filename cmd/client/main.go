@@ -119,6 +119,10 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		log.Printf("tunnel: dial data plane: %v", err)
 		return
 	}
+	if tcpConn, ok := raw.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 	defer raw.Close()
 
 	// Фаза 1: Handshake через текстовый протокол

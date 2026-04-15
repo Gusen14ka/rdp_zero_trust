@@ -157,6 +157,10 @@ func listenData(addr string) {
 			log.Printf("data accept: %v", err)
 			continue
 		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
 		go handleData(conn)
 	}
 }

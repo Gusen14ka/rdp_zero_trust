@@ -1,2 +1,2 @@
-/client.exe
-/server.exe
+*.exe
+certs/

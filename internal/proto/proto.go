@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 // Типы сообщений
@@ -14,6 +15,12 @@ const (
 	MsgSession = "SESSION"
 	MsgOK      = "OK"
 	MsgError   = "ERROR"
+)
+
+// Таймауты
+const (
+	TimeoutRecv = 30
+	TimeoutSend = 30
 )
 
 // Conn — обёртка над net.Conn с буферизованным чтением
@@ -33,12 +40,14 @@ func NewConn(c net.Conn) *Conn {
 func (c *Conn) Send(msgType string, args ...string) error {
 	parts := append([]string{msgType}, args...)
 	line := strings.Join(parts, " ") + "\n"
+	c.conn.SetWriteDeadline(time.Now().Add(TimeoutSend * time.Second))
 	_, err := fmt.Fprint(c.conn, line)
 	return err
 }
 
 // Recv читает одну строку и разбивает на тип + аргументы
 func (c *Conn) Recv() (msgType string, args []string, err error) {
+	//c.conn.SetReadDeadline(time.Now().Add(TimeoutRecv * time.Second))
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
 		return "", nil, err

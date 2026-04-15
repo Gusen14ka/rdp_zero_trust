@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"io"
 	"log"
@@ -19,7 +20,9 @@ var (
 func main() {
 	controlAddr := flag.String("control", ":9000", "адрес control plane")
 	dataAddr := flag.String("data", ":9001", "адрес data plane")
-	configPath := flag.String("config", "config/config.json", "путь к конфигу")
+	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
+	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
+	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
 	flag.Parse()
 
 	// Запускаем оба листенера параллельно
@@ -32,17 +35,26 @@ func main() {
 
 	sessions = session.NewStore()
 
-	go listenControl(*controlAddr)
+	go listenControl(*controlAddr, *certPath, *keyPath)
 	listenData(*dataAddr)
 }
 
 // listenControl — принимает управляющие соединения
-func listenControl(addr string) {
-	ln, err := net.Listen("tcp", addr)
+func listenControl(addr string, certPath, keyPath string) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("tls cert: %v", err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13, // только TLS 1.3
+	}
+
+	ln, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		log.Fatalf("control listen: %v", err)
 	}
-	log.Printf("control plane слушает %s", addr)
+	log.Printf("control plane (TLS) слушает %s", addr)
 
 	for {
 		conn, err := ln.Accept()
@@ -170,13 +182,17 @@ func handleData(raw net.Conn) {
 
 	go func() {
 		io.Copy(target, raw)
-		target.(*net.TCPConn).CloseWrite()
+		if tcp, ok := target.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 
 	go func() {
 		io.Copy(raw, target)
-		raw.(*net.TCPConn).CloseWrite()
+		if tcp, ok := raw.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 

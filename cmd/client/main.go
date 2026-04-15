@@ -1,11 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 
 	"rdp_zero_trust/internal/proto"
 )
@@ -17,10 +20,11 @@ func main() {
 	username := flag.String("user", "user1", "имя пользователя")
 	password := flag.String("pass", "secret", "пароль")
 	machineID := flag.String("machine", "machine1", "ID машины")
+	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")
 	flag.Parse()
 
 	// Шаг 1: control plane — аутентификация и запрос машины
-	sessionID, err := authenticate(*serverAddr, *username, *password, *machineID)
+	sessionID, err := authenticate(*serverAddr, *username, *password, *machineID, *caPath)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
 	}
@@ -43,11 +47,32 @@ func main() {
 	}
 }
 
+func loadTLSConfig(caPath string) (*tls.Config, error) {
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read CA: %w", err)
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("parse CA cert")
+	}
+
+	return &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS13,
+	}, nil
+}
+
 // authenticate подключается к control plane и получает адрес целевой машины
-func authenticate(serverAddr, username, password, machineID string) (string, error) {
-	raw, err := net.Dial("tcp", serverAddr)
+func authenticate(serverAddr, username, password, machineID, caPath string) (string, error) {
+	tlsCfg, err := loadTLSConfig(caPath)
 	if err != nil {
 		return "", err
+	}
+	raw, err := tls.Dial("tcp", serverAddr, tlsCfg)
+	if err != nil {
+		return "", fmt.Errorf("tls dial: %w", err)
 	}
 	// Намеренно не закрываем — держим сессию живой
 	// В продакшне это горутина с keepalive
@@ -58,6 +83,7 @@ func authenticate(serverAddr, username, password, machineID string) (string, err
 	c.Send(proto.MsgHello, username, password)
 	msgType, _, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK {
+		raw.Close()
 		return "", fmt.Errorf("hello rejected")
 	}
 
@@ -65,10 +91,20 @@ func authenticate(serverAddr, username, password, machineID string) (string, err
 	c.Send(proto.MsgConnect, machineID)
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
-		return "", fmt.Errorf("connect rejected: %v", args)
+		raw.Close()
+		return "", fmt.Errorf("connect rejected")
 	}
 
-	return args[0], nil // адрес целевой машины
+	sessionID := args[0]
+
+	go func() {
+		defer raw.Close()
+		buf := make([]byte, 1)
+		raw.Read(buf)
+		log.Printf("control-соединение закрыто")
+	}()
+
+	return sessionID, nil
 }
 
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
@@ -104,15 +140,23 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	// Ждём завершения обоих направлений
 	done := make(chan struct{}, 2)
 
+	// io.Copy в цикле копирует данные (байты) до EOF соединения
+	// когда копирование закончилось мы закрываем соединение (в которое копирутеся)
+	// таким образом data_plane и rdp поймут, где конец
+	// Мы не закрываем сразу соединение, тк это убъёт сразу оба направления, а наш приёмник мог ещё не успеть всё прочитать
 	go func() {
 		io.Copy(raw, local)
-		raw.(*net.TCPConn).CloseWrite()
+		if tcp, ok := raw.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 
 	go func() {
 		io.Copy(local, raw)
-		local.(*net.TCPConn).CloseWrite()
+		if tcp, ok := local.(*net.TCPConn); ok {
+			tcp.CloseWrite()
+		}
 		done <- struct{}{}
 	}()
 

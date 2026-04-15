@@ -110,6 +110,7 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
 func tunnel(local net.Conn, dataAddr, sessionID string) {
 	defer local.Close()
+	log.Printf("tunnel: новое соединение от %s", local.RemoteAddr())
 
 	raw, err := net.Dial("tcp", dataAddr)
 	if err != nil {
@@ -137,7 +138,8 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	log.Printf("tunnel: сессия подтверждена, начинаем передачу данных")
 
 	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
+	log.Printf("tunnel: старт data transfering")
 	pipe.Pipe(raw, local)
 
-	log.Printf("tunnel: сессия завершена")
+	log.Printf("tunnel: завершено")
 }

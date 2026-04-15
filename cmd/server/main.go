@@ -152,7 +152,7 @@ func handleData(raw net.Conn) {
 
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("data: ожидал SESSION <id>")
+		log.Printf("data: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
 		c.Send(proto.MsgError, "invalid session request")
 		return
 	}
@@ -178,5 +178,7 @@ func handleData(raw net.Conn) {
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)
 
+	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
 	pipe.Pipe(target, raw)
+	log.Printf("data: [%s] завершено", sessionID[:8])
 }

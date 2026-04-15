@@ -180,7 +180,8 @@ func handleData(raw net.Conn) {
 	c.Send(proto.MsgOK)
 
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	// ВАЖНО: используем c.RawConn() чтобы избежать конфликта буферов proto.Conn с pipe.Pipe
-	pipe.Pipe(target, c.RawConn())
+	// ВАЖНО: используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
+	// которые bufio.Reader мог прочитать при handshake
+	pipe.Pipe(target, c.DataPlaneConnForPipe())
 	log.Printf("data: [%s] ЗАВЕРШЕНО", sessionID[:8])
 }

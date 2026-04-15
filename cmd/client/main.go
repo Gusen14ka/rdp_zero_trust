@@ -143,9 +143,9 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	}
 	log.Printf("tunnel: [%s] сессия подтверждена, начинаем передачу данных", sessionID[:8])
 
-	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
+	// Фаза 2: Binary transfer — используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
 	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
-	pipe.Pipe(raw, local)
+	pipe.Pipe(c.DataPlaneConnForPipe(), local)
 
 	log.Printf("tunnel: [%s] ЗАВЕРШЕНО data transfering", sessionID[:8])
 }

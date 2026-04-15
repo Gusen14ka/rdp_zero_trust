@@ -121,10 +121,11 @@ func handleControl(raw net.Conn) {
 	c.Send(proto.MsgOK, sess.ID)
 
 	// Держим control-соединение открытым — в будущем здесь будет TTL и сигналы
-	// Пока просто ждём закрытия
-	c.Recv()
+	// Ждём закрытия соединения со стороны клиента
+	msgType, args, err = c.Recv()
+	log.Printf("control-соединение %s: msgType=%s, args=%v, err=%v", sess.ID, msgType, args, err)
 	sessions.Delete(sess.ID)
-	log.Printf("сессия %s завершена", sess.ID)
+	log.Printf("сессия %s завершена (deleted)", sess.ID)
 }
 
 // listenData — принимает data-соединения и проксирует на целевую машину
@@ -165,7 +166,7 @@ func handleData(raw net.Conn) {
 		return
 	}
 
-	log.Printf("data: сессия %s -> %s", sessionID, sess.TargetAddr)
+	log.Printf("data: [%s] НАЧАЛО - подключение -> %s", sessionID[:8], sess.TargetAddr)
 
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
@@ -179,6 +180,7 @@ func handleData(raw net.Conn) {
 	c.Send(proto.MsgOK)
 
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	pipe.Pipe(target, raw)
-	log.Printf("data: [%s] завершено", sessionID[:8])
+	// ВАЖНО: используем c.RawConn() чтобы избежать конфликта буферов proto.Conn с pipe.Pipe
+	pipe.Pipe(target, c.RawConn())
+	log.Printf("data: [%s] ЗАВЕРШЕНО", sessionID[:8])
 }

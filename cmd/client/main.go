@@ -97,9 +97,15 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 
 	sessionID := args[0]
 
+	// Закрываем proto.Conn правильно (важно для TLS)
+	// Держим raw соединение (TLS) открытым для keepalive
+	// Примечание: raw.Close() вызывается через defer в основной функции
+	c = nil // не нужен больше, proto.Conn закроется через GC
+
 	go func() {
 		defer raw.Close()
 		buf := make([]byte, 1)
+		// Блокируемся до закрытия контрольного соединения сервером
 		raw.Read(buf)
 		log.Printf("control-соединение закрыто")
 	}()
@@ -110,7 +116,7 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
 func tunnel(local net.Conn, dataAddr, sessionID string) {
 	defer local.Close()
-	log.Printf("tunnel: новое соединение от %s", local.RemoteAddr())
+	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionID[:8], local.RemoteAddr())
 
 	raw, err := net.Dial("tcp", dataAddr)
 	if err != nil {
@@ -135,11 +141,11 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		}
 		return
 	}
-	log.Printf("tunnel: сессия подтверждена, начинаем передачу данных")
+	log.Printf("tunnel: [%s] сессия подтверждена, начинаем передачу данных", sessionID[:8])
 
 	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
-	log.Printf("tunnel: старт data transfering")
+	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
 	pipe.Pipe(raw, local)
 
-	log.Printf("tunnel: завершено")
+	log.Printf("tunnel: [%s] ЗАВЕРШЕНО data transfering", sessionID[:8])
 }

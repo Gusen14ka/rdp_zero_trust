@@ -197,6 +197,6 @@ func handleData(raw net.Conn) {
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
 	// ВАЖНО: используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
 	// которые bufio.Reader мог прочитать при handshake
-	pipe.Pipe(target, c.DataPlaneConnForPipe())
-	log.Printf("data: [%s] ЗАВЕРШЕНО", sessionID[:8])
+	err1, err2 := pipe.Pipe(target, c.DataPlaneConnForPipe())
+	log.Printf("data: [%s] ЗАВЕРШЕНО, err target->client=%v client->target=%v", sessionID[:8], err1, err2)
 }

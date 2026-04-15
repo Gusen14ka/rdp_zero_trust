@@ -141,7 +141,6 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 
 	// Фаза 2: Binary transfer — используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
 	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
-	pipe.Pipe(c.DataPlaneConnForPipe(), local)
-
-	log.Printf("tunnel: [%s] ЗАВЕРШЕНО data transfering", sessionID[:8])
+	err1, err2 := pipe.Pipe(c.DataPlaneConnForPipe(), local)
+	log.Printf("tunnel: [%s] ЗАВЕРШЕНО data transfering, err data->local=%v err local->data=%v", sessionID[:8], err1, err2)
 }

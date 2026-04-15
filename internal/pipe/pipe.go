@@ -2,6 +2,7 @@ package pipe
 
 import (
 	"io"
+	"log"
 	"net"
 )
 
@@ -25,21 +26,34 @@ func closeWrite(c net.Conn) {
 // таким образом data_plane и rdp поймут, где конец
 // Мы не закрываем сразу соединение, тк это убъёт сразу оба направления, а наш приёмник мог ещё не успеть всё прочитать
 
-func Pipe(a, b net.Conn) {
+func Pipe(a, b net.Conn) (errAB, errBA error) {
 	done := make(chan struct{}, 2)
 
 	go func() {
-		io.Copy(b, a)
+		_, err := io.Copy(b, a)
+		if err != nil {
+			log.Printf("pipe: %s -> %s copy error: %v", a.RemoteAddr(), b.RemoteAddr(), err)
+		} else {
+			log.Printf("pipe: %s -> %s copy finished", a.RemoteAddr(), b.RemoteAddr())
+		}
 		closeWrite(b)
+		errAB = err
 		done <- struct{}{}
 	}()
 
 	go func() {
-		io.Copy(a, b)
+		_, err := io.Copy(a, b)
+		if err != nil {
+			log.Printf("pipe: %s <- %s copy error: %v", a.RemoteAddr(), b.RemoteAddr(), err)
+		} else {
+			log.Printf("pipe: %s <- %s copy finished", a.RemoteAddr(), b.RemoteAddr())
+		}
 		closeWrite(a)
+		errBA = err
 		done <- struct{}{}
 	}()
 
 	<-done
 	<-done
+	return errAB, errBA
 }

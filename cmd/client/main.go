@@ -5,17 +5,17 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 
+	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 )
 
 func main() {
-	serverAddr := flag.String("server", "localhost:9000", "адрес control plane")
-	dataAddr := flag.String("data", "localhost:9001", "адрес data plane")
+	serverAddr := flag.String("server", "192.168.0.21:9000", "адрес control plane")
+	dataAddr := flag.String("data", "192.168.0.21:9001", "адрес data plane")
 	localAddr := flag.String("local", "localhost:13389", "локальный адрес для mstsc")
 	username := flag.String("user", "user1", "имя пользователя")
 	password := flag.String("pass", "secret", "пароль")
@@ -137,30 +137,7 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	log.Printf("tunnel: сессия подтверждена, начинаем передачу данных")
 
 	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
-	// Ждём завершения обоих направлений
-	done := make(chan struct{}, 2)
+	pipe.Pipe(raw, local)
 
-	// io.Copy в цикле копирует данные (байты) до EOF соединения
-	// когда копирование закончилось мы закрываем соединение (в которое копирутеся)
-	// таким образом data_plane и rdp поймут, где конец
-	// Мы не закрываем сразу соединение, тк это убъёт сразу оба направления, а наш приёмник мог ещё не успеть всё прочитать
-	go func() {
-		io.Copy(raw, local)
-		if tcp, ok := raw.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(local, raw)
-		if tcp, ok := local.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
 	log.Printf("tunnel: сессия завершена")
 }

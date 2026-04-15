@@ -3,11 +3,11 @@ package main
 import (
 	"crypto/tls"
 	"flag"
-	"io"
 	"log"
 	"net"
 
 	"rdp_zero_trust/internal/config"
+	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/session"
 )
@@ -178,24 +178,5 @@ func handleData(raw net.Conn) {
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(target, raw)
-		if tcp, ok := target.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(raw, target)
-		if tcp, ok := raw.(*net.TCPConn); ok {
-			tcp.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
+	pipe.Pipe(target, raw)
 }

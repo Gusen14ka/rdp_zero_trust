@@ -212,7 +212,7 @@ func handleData(raw net.Conn) {
 
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)
-
+	raw.SetWriteDeadline(time.Time{})
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
 	// ВАЖНО: используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
 	// которые bufio.Reader мог прочитать при handshake

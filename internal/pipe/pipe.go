@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 )
 
 // Создаём интерфейс для корретной работы с type assertion
@@ -18,6 +19,15 @@ func closeWrite(c net.Conn) {
 	} else {
 		c.Close()
 	}
+}
+
+func SetKeepAlive(c net.Conn) {
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tcp.SetKeepAlive(true)
+	tcp.SetKeepAlivePeriod(10 * time.Second)
 }
 
 // Ждём завершения обоих направлений

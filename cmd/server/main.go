@@ -167,6 +167,7 @@ func listenData(addr string) {
 
 // handleData — первая строка от клиента: SESSION <id>
 func handleData(raw net.Conn) {
+	pipe.SetKeepAlive(raw)
 	c := proto.NewConn(raw)
 	defer raw.Close()
 
@@ -194,6 +195,8 @@ func handleData(raw net.Conn) {
 		return
 	}
 	defer target.Close()
+
+	pipe.SetKeepAlive(target)
 
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)

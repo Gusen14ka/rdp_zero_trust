@@ -88,18 +88,19 @@ type dataPlaneConn struct {
 
 func (dpc *dataPlaneConn) Read(b []byte) (int, error) {
 	if !dpc.bufUsed {
-		// Сначала читаем из буфера
-		n, err := dpc.buffered.Read(b)
-		if err == io.EOF || n == len(b) {
-			dpc.bufUsed = true
-		}
-		if n > 0 {
-			return n, nil
+		if dpc.buffered.Buffered() > 0 {
+			n, err := dpc.buffered.Read(b)
+			if dpc.buffered.Buffered() == 0 {
+				dpc.bufUsed = true
+			}
+			if n > 0 || err != nil {
+				if err == io.EOF && n > 0 {
+					return n, nil
+				}
+				return n, err
+			}
 		}
 		dpc.bufUsed = true
-		if err != nil && err != io.EOF {
-			return 0, err
-		}
 	}
 	// Потом читаем из соединения
 	return dpc.conn.Read(b)

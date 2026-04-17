@@ -20,7 +20,7 @@ const (
 // Таймауты
 const (
 	TimeoutRecv = 30
-	TimeoutSend = 30
+	TimeoutSend = 10
 )
 
 // Conn — обёртка над net.Conn с буферизованным чтением
@@ -41,13 +41,13 @@ func (c *Conn) Send(msgType string, args ...string) error {
 	parts := append([]string{msgType}, args...)
 	line := strings.Join(parts, " ") + "\n"
 	c.conn.SetWriteDeadline(time.Now().Add(TimeoutSend * time.Second))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	_, err := fmt.Fprint(c.conn, line)
 	return err
 }
 
 // Recv читает одну строку и разбивает на тип + аргументы
 func (c *Conn) Recv() (msgType string, args []string, err error) {
-	//c.conn.SetReadDeadline(time.Now().Add(TimeoutRecv * time.Second))
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
 		return "", nil, err

@@ -50,16 +50,16 @@ func listenControl(addr string, certPath, keyPath string) {
 		MinVersion:   tls.VersionTLS13, // только TLS 1.3
 	}
 
-	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	tcpLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		log.Fatalf("control listen: %v", err)
 	}
 	log.Printf("control plane (TLS) слушает %s", addr)
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := tcpLn.Accept()
 		if err != nil {
-			log.Printf("control accept: %v", err)
+			log.Printf("control accept error: %v", err)
 			continue
 		}
 		go handleControl(conn)
@@ -120,11 +120,10 @@ func handleControl(raw net.Conn) {
 	log.Printf("[%s] сессия %s -> %s (%s)", username, sess.ID, machineID, targetAddr)
 	c.Send(proto.MsgOK, sess.ID)
 
-	// Держим control-соединение открытым — в будущем здесь будет TTL и сигналы
-	// Пока просто ждём закрытия
+	// Держим соединение открытым пока клиент не отключится
 	c.Recv()
 	sessions.Delete(sess.ID)
-	log.Printf("сессия %s завершена", sess.ID)
+	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
 // listenData — принимает data-соединения и проксирует на целевую машину
@@ -147,8 +146,11 @@ func listenData(addr string) {
 
 // handleData — первая строка от клиента: SESSION <id>
 func handleData(raw net.Conn) {
-	c := proto.NewConn(raw)
 	defer raw.Close()
+
+	pipe.TuenConn(raw)
+
+	c := proto.NewConn(raw)
 
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
@@ -165,7 +167,7 @@ func handleData(raw net.Conn) {
 		return
 	}
 
-	log.Printf("data: сессия %s -> %s", sessionID, sess.TargetAddr)
+	log.Printf("data: [%s] НАЧАЛО - подключение -> %s", sessionID[:8], sess.TargetAddr)
 
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
@@ -175,10 +177,13 @@ func handleData(raw net.Conn) {
 	}
 	defer target.Close()
 
+	pipe.TuenConn(target)
+
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)
 
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	pipe.Pipe(target, raw)
-	log.Printf("data: [%s] завершено", sessionID[:8])
+	// После handshake буфер reader пуст — передаём raw напрямую
+	err1, err2 := pipe.Pipe(raw, target)
+	log.Printf("data: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }

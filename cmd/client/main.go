@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
@@ -70,7 +71,9 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	if err != nil {
 		return "", err
 	}
-	raw, err := tls.Dial("tcp", serverAddr, tlsCfg)
+
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	raw, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
 	if err != nil {
 		return "", fmt.Errorf("tls dial: %w", err)
 	}
@@ -97,11 +100,12 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 
 	sessionID := args[0]
 
+	// Держим proto.Conn открытым до закрытия контрольного соединения
 	go func() {
 		defer raw.Close()
 		buf := make([]byte, 1)
 		raw.Read(buf)
-		log.Printf("control-соединение закрыто")
+		log.Printf("control-соединение закрыто сервером")
 	}()
 
 	return sessionID, nil
@@ -110,7 +114,7 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
 func tunnel(local net.Conn, dataAddr, sessionID string) {
 	defer local.Close()
-	log.Printf("tunnel: новое соединение от %s", local.RemoteAddr())
+	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionID[:8], local.RemoteAddr())
 
 	raw, err := net.Dial("tcp", dataAddr)
 	if err != nil {
@@ -118,6 +122,8 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		return
 	}
 	defer raw.Close()
+
+	pipe.TuenConn(raw)
 
 	// Фаза 1: Handshake через текстовый протокол
 	c := proto.NewConn(raw)
@@ -135,11 +141,11 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		}
 		return
 	}
-	log.Printf("tunnel: сессия подтверждена, начинаем передачу данных")
+	log.Printf("tunnel: [%s] старт", sessionID[:8])
 
-	// Фаза 2: Binary transfer — используем raw соединение (буфер Proto уже прочитан)
-	log.Printf("tunnel: старт data transfering")
-	pipe.Pipe(raw, local)
-
-	log.Printf("tunnel: завершено")
+	// Фаза 2: Binary transfer
+	// После handshake буфер reader пуст — передаём raw напрямую
+	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
+	err1, err2 := pipe.Pipe(raw, local)
+	log.Printf("tunnel: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }

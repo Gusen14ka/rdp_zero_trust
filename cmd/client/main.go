@@ -102,8 +102,30 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	// Держим proto.Conn открытым до закрытия контрольного соединения
 	go func() {
 		defer raw.Close()
-		msgType, args, err := c.Recv()
-		log.Printf("control-соединение закрыто: msgType=%s args=%v err=%v", msgType, args, err)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			if err := c.Send(proto.MsgPing); err != nil {
+				log.Printf("control keepalive send failed: %v", err)
+				return
+			}
+
+			msgType, _, err := c.Recv()
+			if err != nil {
+				log.Printf("control keepalive recv failed: %v", err)
+				return
+			}
+			if msgType != proto.MsgPong {
+				log.Printf("control keepalive: unexpected msgType=%s", msgType)
+				return
+			}
+
+			select {
+			case <-ticker.C:
+				continue
+			}
+		}
 	}()
 
 	return sessionID, nil

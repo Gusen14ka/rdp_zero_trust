@@ -14,6 +14,8 @@ const (
 	MsgHello   = "HELLO"
 	MsgConnect = "CONNECT"
 	MsgSession = "SESSION"
+	MsgPing    = "PING"
+	MsgPong    = "PONG"
 	MsgOK      = "OK"
 	MsgError   = "ERROR"
 )

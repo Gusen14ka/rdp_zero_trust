@@ -135,10 +135,20 @@ func handleControl(raw net.Conn) {
 	log.Printf("[%s] сессия %s -> %s (%s)", username, sess.ID, machineID, targetAddr)
 	c.Send(proto.MsgOK, sess.ID)
 
-	// Держим control-соединение открытым — в будущем здесь будет TTL и сигналы
-	// Ждём закрытия соединения со стороны клиента
-	msgType, args, err = c.Recv()
-	log.Printf("control-соединение %s: msgType=%s, args=%v, err=%v", sess.ID, msgType, args, err)
+	// Держим control-соединение открытым — отвечаем на PING и ждём закрытия
+	for {
+		msgType, args, err = c.Recv()
+		if err != nil {
+			log.Printf("control-соединение %s: msgType=%s, args=%v, err=%v", sess.ID, msgType, args, err)
+			break
+		}
+		switch msgType {
+		case proto.MsgPing:
+			c.Send(proto.MsgPong)
+		default:
+			log.Printf("control-sоединение %s: unexpected msgType=%s args=%v", sess.ID, msgType, args)
+		}
+	}
 	sessions.Delete(sess.ID)
 	log.Printf("сессия %s завершена (deleted)", sess.ID)
 }

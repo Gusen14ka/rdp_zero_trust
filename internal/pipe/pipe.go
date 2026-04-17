@@ -21,14 +21,14 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-func TuenConn(c net.Conn) {
+func TuneConn(c net.Conn) {
 	tcp, ok := c.(*net.TCPConn)
 	if !ok {
 		return
 	}
-	tcp.SetKeepAlive(true)
-	tcp.SetKeepAlivePeriod(10 * time.Second)
-	tcp.SetNoDelay(true)
+	tcp.SetKeepAlive(true)                   // ОС периодически отправляет пустые пакет
+	tcp.SetKeepAlivePeriod(10 * time.Second) // Устанавливаем период
+	tcp.SetNoDelay(true)                     // Отключаем алгоритм Нейгла (группировку маленьких пакетов в пачку для снижения нагрузки на сеть)
 }
 
 // Ждём завершения обоих направлений

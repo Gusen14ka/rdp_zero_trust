@@ -44,7 +44,7 @@ func main() {
 			log.Printf("local accept: %v", err)
 			continue
 		}
-		go tunnel(local, *dataAddr, sessionID)
+		go tunnel(local, *dataAddr, sessionID, *caPath)
 	}
 }
 
@@ -72,7 +72,7 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 		return "", err
 	}
 
-	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+	dialer := pipe.NoDelayDialer(30 * time.Second)
 	raw, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
 	if err != nil {
 		return "", fmt.Errorf("tls dial: %w", err)
@@ -112,18 +112,22 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 }
 
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
-func tunnel(local net.Conn, dataAddr, sessionID string) {
+func tunnel(local net.Conn, dataAddr, sessionID, caPath string) {
 	defer local.Close()
 	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionID[:8], local.RemoteAddr())
 
-	raw, err := net.Dial("tcp", dataAddr)
+	tlsCfg, err := loadTLSConfig(caPath)
+	if err != nil {
+		log.Printf("tunnel: tls config: %v", err)
+	}
+
+	dialer := pipe.NoDelayDialer(10 * time.Second)
+	raw, err := tls.DialWithDialer(dialer, "tcp", dataAddr, tlsCfg)
 	if err != nil {
 		log.Printf("tunnel: dial data plane: %v", err)
 		return
 	}
 	defer raw.Close()
-
-	pipe.TuenConn(raw)
 
 	// Фаза 1: Handshake через текстовый протокол
 	c := proto.NewConn(raw)

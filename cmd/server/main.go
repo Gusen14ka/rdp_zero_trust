@@ -36,7 +36,7 @@ func main() {
 	sessions = session.NewStore()
 
 	go listenControl(*controlAddr, *certPath, *keyPath)
-	listenData(*dataAddr)
+	listenData(*dataAddr, *certPath, *keyPath)
 }
 
 // listenControl — принимает управляющие соединения
@@ -127,12 +127,21 @@ func handleControl(raw net.Conn) {
 }
 
 // listenData — принимает data-соединения и проксирует на целевую машину
-func listenData(addr string) {
-	ln, err := net.Listen("tcp", addr)
+func listenData(addr, certPath, keyPath string) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("data tls cert: %v", err)
+	}
+	tlsCfg := tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	ln, err := tls.Listen("tcp", addr, &tlsCfg)
 	if err != nil {
 		log.Fatalf("data listen: %v", err)
 	}
-	log.Printf("data plane слушает %s", addr)
+	log.Printf("data plane (TLS) слушает %s", addr)
 
 	for {
 		conn, err := ln.Accept()
@@ -148,7 +157,10 @@ func listenData(addr string) {
 func handleData(raw net.Conn) {
 	defer raw.Close()
 
-	pipe.TuenConn(raw)
+	// raw принятый по tls.Listen лишь реализует интерфейс net.Conn, внутри он tls.Conn
+	// Но это не проблема, тк его настройки уже заданы на клиенте
+	// Смысла в TuneConn просто нет
+	// pipe.TuneConn(raw)
 
 	c := proto.NewConn(raw)
 
@@ -177,7 +189,8 @@ func handleData(raw net.Conn) {
 	}
 	defer target.Close()
 
-	pipe.TuenConn(target)
+	// target по tcp и он реально *net.TCPConn
+	pipe.TuneConn(target)
 
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)

@@ -71,6 +71,7 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	if err != nil {
 		return "", err
 	}
+
 	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
 	raw, err := tls.DialWithDialer(dialer, "tcp", serverAddr, tlsCfg)
 	if err != nil {
@@ -102,30 +103,9 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	// Держим proto.Conn открытым до закрытия контрольного соединения
 	go func() {
 		defer raw.Close()
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			if err := c.Send(proto.MsgPing); err != nil {
-				log.Printf("control keepalive send failed: %v", err)
-				return
-			}
-
-			msgType, _, err := c.Recv()
-			if err != nil {
-				log.Printf("control keepalive recv failed: %v", err)
-				return
-			}
-			if msgType != proto.MsgPong {
-				log.Printf("control keepalive: unexpected msgType=%s", msgType)
-				return
-			}
-
-			select {
-			case <-ticker.C:
-				continue
-			}
-		}
+		buf := make([]byte, 1)
+		raw.Read(buf)
+		log.Printf("control-соединение закрыто сервером")
 	}()
 
 	return sessionID, nil
@@ -141,12 +121,13 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		log.Printf("tunnel: dial data plane: %v", err)
 		return
 	}
+	defer raw.Close()
+
 	if tcpConn, ok := raw.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		tcpConn.SetNoDelay(true)
 	}
-	defer raw.Close()
 
 	// Фаза 1: Handshake через текстовый протокол
 	c := proto.NewConn(raw)
@@ -164,10 +145,11 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 		}
 		return
 	}
-	log.Printf("tunnel: [%s] сессия подтверждена, начинаем передачу данных", sessionID[:8])
+	log.Printf("tunnel: [%s] старт", sessionID[:8])
 
-	// Фаза 2: Binary transfer — используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
+	// Фаза 2: Binary transfer
+	// После handshake буфер reader пуст — передаём raw напрямую
 	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
-	err1, err2 := pipe.Pipe(c.DataPlaneConnForPipe(), local)
-	log.Printf("tunnel: [%s] ЗАВЕРШЕНО data transfering, err data->local=%v err local->data=%v", sessionID[:8], err1, err2)
+	err1, err2 := pipe.Pipe(raw, local)
+	log.Printf("tunnel: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }

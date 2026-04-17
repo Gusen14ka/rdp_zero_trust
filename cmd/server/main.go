@@ -51,7 +51,7 @@ func listenControl(addr string, certPath, keyPath string) {
 		MinVersion:   tls.VersionTLS13, // только TLS 1.3
 	}
 
-	tcpLn, err := net.Listen("tcp", addr)
+	tcpLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		log.Fatalf("control listen: %v", err)
 	}
@@ -60,25 +60,10 @@ func listenControl(addr string, certPath, keyPath string) {
 	for {
 		conn, err := tcpLn.Accept()
 		if err != nil {
-			log.Printf("control accept: %v", err)
+			log.Printf("control accept error: %v", err)
 			continue
 		}
-
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
-			tcpConn.SetNoDelay(true)
-		}
-
-		go func(raw net.Conn) {
-			defer raw.Close()
-			tlsConn := tls.Server(raw, tlsCfg)
-			if err := tlsConn.Handshake(); err != nil {
-				log.Printf("control tls handshake: %v", err)
-				return
-			}
-			handleControl(tlsConn)
-		}(conn)
+		go handleControl(conn)
 	}
 }
 
@@ -136,22 +121,10 @@ func handleControl(raw net.Conn) {
 	log.Printf("[%s] сессия %s -> %s (%s)", username, sess.ID, machineID, targetAddr)
 	c.Send(proto.MsgOK, sess.ID)
 
-	// Держим control-соединение открытым — отвечаем на PING и ждём закрытия
-	for {
-		msgType, args, err = c.Recv()
-		if err != nil {
-			log.Printf("control-соединение %s: msgType=%s, args=%v, err=%v", sess.ID, msgType, args, err)
-			break
-		}
-		switch msgType {
-		case proto.MsgPing:
-			c.Send(proto.MsgPong)
-		default:
-			log.Printf("control-sоединение %s: unexpected msgType=%s args=%v", sess.ID, msgType, args)
-		}
-	}
+	// Держим соединение открытым пока клиент не отключится
+	c.Recv()
 	sessions.Delete(sess.ID)
-	log.Printf("сессия %s завершена (deleted)", sess.ID)
+	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
 // listenData — принимает data-соединения и проксирует на целевую машину
@@ -168,20 +141,21 @@ func listenData(addr string) {
 			log.Printf("data accept: %v", err)
 			continue
 		}
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
-			tcpConn.SetNoDelay(true)
-		}
 		go handleData(conn)
 	}
 }
 
 // handleData — первая строка от клиента: SESSION <id>
 func handleData(raw net.Conn) {
-	pipe.SetKeepAlive(raw)
-	c := proto.NewConn(raw)
 	defer raw.Close()
+
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(10 * time.Second)
+		tcp.SetNoDelay(true)
+	}
+
+	c := proto.NewConn(raw)
 
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
@@ -208,14 +182,17 @@ func handleData(raw net.Conn) {
 	}
 	defer target.Close()
 
-	pipe.SetKeepAlive(target)
+	if tcp, ok := target.(*net.TCPConn); ok {
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(10 * time.Second)
+		tcp.SetNoDelay(true)
+	}
 
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)
-	raw.SetWriteDeadline(time.Time{})
+
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	// ВАЖНО: используем DataPlaneConnForPipe() чтобы сохранить буферизованные данные
-	// которые bufio.Reader мог прочитать при handshake
-	err1, err2 := pipe.Pipe(target, c.DataPlaneConnForPipe())
-	log.Printf("data: [%s] ЗАВЕРШЕНО, err target->client=%v client->target=%v", sessionID[:8], err1, err2)
+	// После handshake буфер reader пуст — передаём raw напрямую
+	err1, err2 := pipe.Pipe(raw, target)
+	log.Printf("data: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }

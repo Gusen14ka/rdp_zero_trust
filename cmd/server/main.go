@@ -67,6 +67,7 @@ func listenControl(addr string, certPath, keyPath string) {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			tcpConn.SetNoDelay(true)
 		}
 
 		go func(raw net.Conn) {
@@ -170,6 +171,7 @@ func listenData(addr string) {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			tcpConn.SetNoDelay(true)
 		}
 		go handleData(conn)
 	}

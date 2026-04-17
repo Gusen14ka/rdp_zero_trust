@@ -144,6 +144,7 @@ func tunnel(local net.Conn, dataAddr, sessionID string) {
 	if tcpConn, ok := raw.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetNoDelay(true)
 	}
 	defer raw.Close()
 

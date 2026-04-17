@@ -21,13 +21,14 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-func SetKeepAlive(c net.Conn) {
+func TuenConn(c net.Conn) {
 	tcp, ok := c.(*net.TCPConn)
 	if !ok {
 		return
 	}
 	tcp.SetKeepAlive(true)
 	tcp.SetKeepAlivePeriod(10 * time.Second)
+	tcp.SetNoDelay(true)
 }
 
 // Ждём завершения обоих направлений

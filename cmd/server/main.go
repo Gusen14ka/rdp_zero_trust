@@ -5,7 +5,6 @@ import (
 	"flag"
 	"log"
 	"net"
-	"time"
 
 	"rdp_zero_trust/internal/config"
 	"rdp_zero_trust/internal/pipe"
@@ -149,11 +148,7 @@ func listenData(addr string) {
 func handleData(raw net.Conn) {
 	defer raw.Close()
 
-	if tcp, ok := raw.(*net.TCPConn); ok {
-		tcp.SetKeepAlive(true)
-		tcp.SetKeepAlivePeriod(10 * time.Second)
-		tcp.SetNoDelay(true)
-	}
+	pipe.TuenConn(raw)
 
 	c := proto.NewConn(raw)
 
@@ -182,11 +177,7 @@ func handleData(raw net.Conn) {
 	}
 	defer target.Close()
 
-	if tcp, ok := target.(*net.TCPConn); ok {
-		tcp.SetKeepAlive(true)
-		tcp.SetKeepAlivePeriod(10 * time.Second)
-		tcp.SetNoDelay(true)
-	}
+	pipe.TuenConn(target)
 
 	// Отправляем подтверждение: сервер готов к передаче RDP данных
 	c.Send(proto.MsgOK)

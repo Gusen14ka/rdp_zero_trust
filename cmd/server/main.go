@@ -138,7 +138,7 @@ func handleQUIC(conn *quic.Conn) {
 	c.Send(proto.MsgOK)
 
 	log.Printf("quic: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	err1, err2 := pipe.Pipe(qconn, target)
+	err1, err2 := pipe.PipeWithDone(qconn, target, sess.Done())
 	log.Printf("quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }
 
@@ -327,6 +327,6 @@ func handleData(raw net.Conn) {
 
 	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
 	// После handshake буфер reader пуст — передаём raw напрямую
-	err1, err2 := pipe.Pipe(raw, target)
+	err1, err2 := pipe.PipeWithDone(raw, target, sess.Done())
 	log.Printf("data: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }

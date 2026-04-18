@@ -36,9 +36,24 @@ func TuneConn(c net.Conn) {
 // когда копирование закончилось мы закрываем соединение (в которое копирутеся)
 // таким образом data_plane и rdp поймут, где конец
 // Мы не закрываем сразу соединение, тк это убъёт сразу оба направления, а наш приёмник мог ещё не успеть всё прочитать
-
 func Pipe(a, b net.Conn) (errAB, errBA error) {
-	done := make(chan struct{}, 2)
+	errAB, errBA = PipeWithDone(a, b, nil)
+	return errAB, errBA
+}
+
+func PipeWithDone(a, b net.Conn, done <-chan struct{}) (errAB, errBA error) {
+	// Если done не nil — запускаем горутину которая закроет соединения
+	// когда сессия завершится
+	if done != nil {
+		go func() {
+			<-done
+			// Закрываем оба конца — это разблокирует io.Copy в обоих направлениях
+			a.Close()
+			b.Close()
+		}()
+	}
+
+	errCh := make(chan error, 2)
 
 	go func() {
 		_, err := io.Copy(b, a)
@@ -48,8 +63,7 @@ func Pipe(a, b net.Conn) (errAB, errBA error) {
 			log.Printf("pipe: %s -> %s copy finished", a.RemoteAddr(), b.RemoteAddr())
 		}
 		closeWrite(b)
-		errAB = err
-		done <- struct{}{}
+		errCh <- err
 	}()
 
 	go func() {
@@ -60,11 +74,10 @@ func Pipe(a, b net.Conn) (errAB, errBA error) {
 			log.Printf("pipe: %s <- %s copy finished", a.RemoteAddr(), b.RemoteAddr())
 		}
 		closeWrite(a)
-		errBA = err
-		done <- struct{}{}
+		errCh <- err
 	}()
 
-	<-done
-	<-done
+	errAB = <-errCh
+	errBA = <-errCh
 	return errAB, errBA
 }

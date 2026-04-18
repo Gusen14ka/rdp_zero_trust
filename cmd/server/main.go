@@ -52,7 +52,7 @@ func main() {
 	go adminSrv.Start(*adminAddr)
 
 	go listenControl(*controlAddr, *certPath, *keyPath)
-	listenTCPData(*dataTCPAddr, *certPath, *keyPath)
+	go listenTCPData(*dataTCPAddr, *certPath, *keyPath)
 	listenQUICData(*dataQUICAddr, *certPath, *keyPath)
 }
 

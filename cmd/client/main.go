@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -12,16 +13,21 @@ import (
 
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
+	"rdp_zero_trust/internal/quicconn"
+
+	"github.com/quic-go/quic-go"
 )
 
 func main() {
 	serverAddr := flag.String("server", "192.168.0.21:9000", "адрес control plane")
 	dataAddr := flag.String("data", "192.168.0.21:9001", "адрес data plane")
+	dataQUICAddr := flag.String("quic", "192.168.0.21:9002", "адрес data plane (QUIC)")
 	localAddr := flag.String("local", "localhost:13389", "локальный адрес для mstsc")
 	username := flag.String("user", "user1", "имя пользователя")
 	password := flag.String("pass", "secret", "пароль")
 	machineID := flag.String("machine", "machine1", "ID машины")
 	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")
+	transport := flag.String("transport", "tcp", "транспорт data plane: tcp или quic")
 	flag.Parse()
 
 	// Шаг 1: control plane — аутентификация и запрос машины
@@ -44,7 +50,13 @@ func main() {
 			log.Printf("local accept: %v", err)
 			continue
 		}
-		go tunnel(local, *dataAddr, sessionID, *caPath)
+
+		switch *transport {
+		case "tcp":
+			go tunnelTCP(local, *dataAddr, sessionID, *caPath)
+		case "quic":
+			go tunnelQUIC(local, *dataQUICAddr, sessionID, *caPath)
+		}
 	}
 }
 
@@ -111,8 +123,59 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	return sessionID, nil
 }
 
+// tunnelQUIC — QUIC версия туннеля
+func tunnelQUIC(local net.Conn, quicAddr, sessionID, caPath string) {
+	defer local.Close()
+	log.Printf("tunnel quic: [%s] новое соединение от %s", sessionID[:8], local.RemoteAddr())
+
+	tlsCfg, err := loadTLSConfig(caPath)
+	if err != nil {
+		log.Printf("tunnel quic: tls config: %v", err)
+		return
+	}
+	// ALPN должен совпадать с сервером
+	tlsCfg.NextProtos = []string{"rdp-zero-trust"}
+
+	// Устанавливаем QUIC соединение
+	conn, err := quic.DialAddr(context.Background(), quicAddr, tlsCfg, &quic.Config{
+		MaxIdleTimeout:  5 * time.Minute,
+		KeepAlivePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		log.Printf("tunnel quic: dial: %v", err)
+		return
+	}
+	defer conn.CloseWithError(0, "done")
+
+	// Открываем стрим внутри QUIC соединения
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		log.Printf("tunnel quic: open stream: %v", err)
+		return
+	}
+
+	// Оборачиваем в net.Conn и делаем handshake — всё то же самое что в TCP
+	qconn := quicconn.New(conn, stream)
+	c := proto.NewConn(qconn)
+	c.Send(proto.MsgSession, sessionID)
+
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgOK {
+		if len(args) > 0 {
+			log.Printf("tunnel quic: сервер отклонил: %s", args[0])
+		} else {
+			log.Printf("tunnel quic: ошибка handshake: %v", err)
+		}
+		return
+	}
+	log.Printf("tunnel quic: [%s] старт", sessionID[:8])
+
+	err1, err2 := pipe.Pipe(qconn, local)
+	log.Printf("tunnel quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+}
+
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
-func tunnel(local net.Conn, dataAddr, sessionID, caPath string) {
+func tunnelTCP(local net.Conn, dataAddr, sessionID, caPath string) {
 	defer local.Close()
 	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionID[:8], local.RemoteAddr())
 

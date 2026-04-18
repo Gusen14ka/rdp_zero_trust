@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"log"
 	"net"
+	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"rdp_zero_trust/internal/config"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
+	"rdp_zero_trust/internal/quicconn"
 	"rdp_zero_trust/internal/session"
 )
 
@@ -19,7 +24,8 @@ var (
 
 func main() {
 	controlAddr := flag.String("control", ":9000", "адрес control plane")
-	dataAddr := flag.String("data", ":9001", "адрес data plane")
+	dataTCPAddr := flag.String("data", ":9001", "адрес data plane (TCP)")
+	dataQUICAddr := flag.String("quic", ":9002", "адрес data plane (QUIC)")
 	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
@@ -36,11 +42,98 @@ func main() {
 	sessions = session.NewStore()
 
 	go listenControl(*controlAddr, *certPath, *keyPath)
-	listenData(*dataAddr, *certPath, *keyPath)
+	listenTCPData(*dataTCPAddr, *certPath, *keyPath)
+	listenQUICData(*dataQUICAddr, *certPath, *keyPath)
 }
 
-// listenControl — принимает управляющие соединения
-func listenControl(addr string, certPath, keyPath string) {
+// listenQUICData — принимает QUIC соединения на data plane
+func listenQUICData(addr, certPath, keyPath string) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("quic tls cert: %v", err)
+	}
+
+	// TLS конфиг для QUIC — указываем NextProtos (ALPN)
+	// это обязательно для QUIC, идентифицирует наш протокол
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"rdp-zero-trust"},
+	}
+
+	ln, err := quic.ListenAddr(addr, tlsCfg, &quic.Config{
+		// Максимальное время простоя соединения
+		MaxIdleTimeout: 5 * time.Minute,
+		// Разрешаем keepalive — QUIC будет слать PING фреймы
+		KeepAlivePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("quic listen: %v", err)
+	}
+	log.Printf("data plane (QUIC) слушает %s", addr)
+
+	for {
+		// Принимаем новое QUIC соединение
+		conn, err := ln.Accept(context.Background())
+		if err != nil {
+			log.Printf("quic accept: %v", err)
+			continue
+		}
+		go handleQUIC(conn)
+	}
+}
+
+// handleQUIC — обрабатывает одно QUIC соединение
+// Одно соединение = один стрим = одна RDP сессия
+func handleQUIC(conn *quic.Conn) {
+	defer conn.CloseWithError(0, "done")
+
+	// Принимаем стрим от клиента
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("quic accept stream: %v", err)
+		return
+	}
+	defer stream.Close()
+
+	// Дальше всё то же самое что в handleData —
+	// стрим реализует net.Conn-подобный интерфейс
+	qconn := quicconn.New(conn, stream)
+	c := proto.NewConn(qconn)
+
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
+		log.Printf("quic: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
+		c.Send(proto.MsgError, "invalid session request")
+		return
+	}
+	sessionID := args[0]
+
+	sess, ok := sessions.Get(sessionID)
+	if !ok {
+		log.Printf("quic: неизвестная сессия %s", sessionID)
+		c.Send(proto.MsgError, "session not found")
+		return
+	}
+
+	target, err := net.Dial("tcp", sess.TargetAddr)
+	if err != nil {
+		log.Printf("quic: не могу подключиться к %s: %v", sess.TargetAddr, err)
+		c.Send(proto.MsgError, "target connection failed")
+		return
+	}
+	defer target.Close()
+
+	pipe.TuneConn(target)
+	c.Send(proto.MsgOK)
+
+	log.Printf("quic: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
+	err1, err2 := pipe.Pipe(qconn, target)
+	log.Printf("quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+}
+
+// listenControl — принимает управляющие tcp соединения на data plane
+func listenControl(addr, certPath, keyPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("tls cert: %v", err)
@@ -126,8 +219,8 @@ func handleControl(raw net.Conn) {
 	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
-// listenData — принимает data-соединения и проксирует на целевую машину
-func listenData(addr, certPath, keyPath string) {
+// listenTCPData — принимает tcp data-соединения и проксирует на целевую машину
+func listenTCPData(addr, certPath, keyPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("data tls cert: %v", err)

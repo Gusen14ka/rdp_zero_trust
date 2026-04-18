@@ -115,9 +115,16 @@ func authenticate(serverAddr, username, password, machineID, caPath string) (str
 	// Держим proto.Conn открытым до закрытия контрольного соединения
 	go func() {
 		defer raw.Close()
-		buf := make([]byte, 1)
-		raw.Read(buf)
-		log.Printf("control-соединение закрыто сервером")
+		// Ждём сообщения от сервера — это либо истечение TTL либо отзыв
+		msgType, args, err := c.Recv()
+		if err != nil {
+			log.Printf("control: соединение закрыто")
+		} else if msgType == proto.MsgError && len(args) > 0 {
+			// Сервер прислал причину завершения
+			log.Printf("control: сессия завершена сервером: %s", args[0])
+		}
+		// В продакшне здесь был бы graceful shutdown всех активных туннелей
+		// Пока просто логируем — mstsc сам увидит что соединение пропало
 	}()
 
 	return sessionID, nil

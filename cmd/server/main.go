@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"rdp_zero_trust/internal/admin"
 	"rdp_zero_trust/internal/config"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
@@ -18,18 +19,23 @@ import (
 )
 
 var (
-	cfg      *config.Config
-	sessions *session.Store
+	cfg        *config.Config
+	sessions   *session.Store
+	sessionTTL time.Duration
 )
 
 func main() {
 	controlAddr := flag.String("control", ":9000", "адрес control plane")
 	dataTCPAddr := flag.String("data", ":9001", "адрес data plane (TCP)")
 	dataQUICAddr := flag.String("quic", ":9002", "адрес data plane (QUIC)")
+	adminAddr := flag.String("admin", "127.0.0.1:9999", "адрес admin HTTP (только localhost)")
 	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
+	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
 	flag.Parse()
+
+	sessionTTL = *ttl
 
 	// Запускаем оба листенера параллельно
 	var err error
@@ -40,6 +46,10 @@ func main() {
 	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
 
 	sessions = session.NewStore()
+
+	// Запускаем admin HTTP сервер
+	adminSrv := admin.NewServer(sessions)
+	go adminSrv.Start(*adminAddr)
 
 	go listenControl(*controlAddr, *certPath, *keyPath)
 	listenTCPData(*dataTCPAddr, *certPath, *keyPath)
@@ -203,18 +213,45 @@ func handleControl(raw net.Conn) {
 	}
 
 	// Создаём сессию
-	sess, err := sessions.Create(username, machineID, targetAddr)
+	sess, err := sessions.Create(username, machineID, targetAddr, sessionTTL)
 	if err != nil {
 		c.Send(proto.MsgError, "internal error")
 		log.Printf("create session: %v", err)
 		return
 	}
 
-	log.Printf("[%s] сессия %s -> %s (%s)", username, sess.ID, machineID, targetAddr)
+	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
+		username, sess.ID, machineID, sessionTTL, sess.ExpiresAt.Format("15:04:05"))
 	c.Send(proto.MsgOK, sess.ID)
 
-	// Держим соединение открытым пока клиент не отключится
-	c.Recv()
+	// Ждём одно из 3 событий:
+	// 1. TTL истёк
+	// 2. Сессия отозвана admin API
+	// 3. Клиент сам отключился
+	ttlTimer := time.NewTimer(time.Until(sess.ExpiresAt))
+	defer ttlTimer.Stop()
+
+	// Канал для отслеживания закрытия соединения клиентов
+	clientGone := make(chan struct{})
+	go func() {
+		// Блокируемся на чтении — когда клиент закроет соединение получим ошибку
+		c.Recv()
+		close(clientGone)
+	}()
+
+	select {
+	case <-ttlTimer.C:
+		log.Printf("сессия %s истекла по TTL", sess.ID)
+		c.Send(proto.MsgError, "session expired")
+
+	case <-sess.Done():
+		log.Printf("сессия %s отозвана администратором", sess.ID)
+		c.Send(proto.MsgError, "session revoked")
+
+	case <-clientGone:
+		log.Printf("сессия %s: клиент отключился", sess.ID)
+	}
+
 	sessions.Delete(sess.ID)
 	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }

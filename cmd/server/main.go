@@ -12,6 +12,7 @@ import (
 
 	"rdp_zero_trust/internal/admin"
 	"rdp_zero_trust/internal/config"
+	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -29,7 +30,9 @@ func main() {
 	dataTCPAddr := flag.String("data", ":9001", "адрес data plane (TCP)")
 	dataQUICAddr := flag.String("quic", ":9002", "адрес data plane (QUIC)")
 	adminAddr := flag.String("admin", "127.0.0.1:9999", "адрес admin HTTP (только localhost)")
+	enrollAddr := flag.String("enroll", ":9003", "адрес enrollment сервера")
 	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
+	caKeyPath := flag.String("ca-key", "certs/ca.key", "приватный ключ CA")
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
 	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
@@ -46,6 +49,20 @@ func main() {
 	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
 
 	sessions = session.NewStore()
+
+	// Enrollment сервер
+	enrollSrv, err := enrollServer.NewServer(*caKeyPath, "certs/ca.crt")
+	if err != nil {
+		log.Fatalf("enrollment server: %v", err)
+	}
+	// Регистрируем способ аутентификации — пароль
+	// Чтобы добавить TOTP: enrollSrv.RegisterAuth(enrollment.NewTOTPAuthHandler(...))
+	enrollSrv.RegisterAuth(enrollServer.NewPasswordAuthHandler(cfg))
+	go func() {
+		if err := enrollSrv.Start(*enrollAddr, *certPath, *keyPath); err != nil {
+			log.Fatalf("enrollment: %v", err)
+		}
+	}()
 
 	// Запускаем admin HTTP сервер
 	adminSrv := admin.NewServer(sessions)

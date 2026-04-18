@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"rdp_zero_trust/internal/saving"
 )
 
 func main() {
@@ -20,13 +22,18 @@ func main() {
 
 	// 1. Генерируем корневой CA
 	caKey, caCert := generateCA()
-	saveKey("certs/ca.key", caKey)
+
+	if err := saving.SaveKey("certs/ca.key", caKey); err != nil {
+		log.Fatalf("save CA key: %v", err)
+	}
 	saveCert("certs/ca.crt", caCert)
 	log.Println("CA сгенерирован")
 
 	// 2. Генерируем сертификат сервера подписанный CA
 	serverKey, serverCert := generateServerCert(caKey, caCert)
-	saveKey("certs/server.key", serverKey)
+	if err := saving.SaveKey("certs/server.key", serverKey); err != nil {
+		log.Fatalf("save server key: %v", err)
+	}
 	saveCert("certs/server.crt", serverCert)
 	log.Println("Сертификат сервера сгенерирован")
 
@@ -96,20 +103,6 @@ func generateServerCert(caKey *ecdsa.PrivateKey, caCert *x509.Certificate) (*ecd
 
 	cert, _ := x509.ParseCertificate(certDER)
 	return key, cert
-}
-
-func saveKey(path string, key *ecdsa.PrivateKey) {
-	f, err := os.Create(path)
-	if err != nil {
-		log.Fatalf("create key file: %v", err)
-	}
-	defer f.Close()
-
-	b, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		log.Fatalf("marshal key: %v", err)
-	}
-	pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: b})
 }
 
 func saveCert(path string, cert *x509.Certificate) {

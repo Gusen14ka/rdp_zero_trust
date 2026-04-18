@@ -3,14 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"time"
 
+	"rdp_zero_trust/internal/loading"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -60,26 +59,9 @@ func main() {
 	}
 }
 
-func loadTLSConfig(caPath string) (*tls.Config, error) {
-	caCert, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("read CA: %w", err)
-	}
-
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("parse CA cert")
-	}
-
-	return &tls.Config{
-		RootCAs:    pool,
-		MinVersion: tls.VersionTLS13,
-	}, nil
-}
-
 // authenticate подключается к control plane и получает адрес целевой машины
 func authenticate(serverAddr, username, password, machineID, caPath string) (string, error) {
-	tlsCfg, err := loadTLSConfig(caPath)
+	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
 		return "", err
 	}
@@ -135,7 +117,7 @@ func tunnelQUIC(local net.Conn, quicAddr, sessionID, caPath string) {
 	defer local.Close()
 	log.Printf("tunnel quic: [%s] новое соединение от %s", sessionID[:8], local.RemoteAddr())
 
-	tlsCfg, err := loadTLSConfig(caPath)
+	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
 		log.Printf("tunnel quic: tls config: %v", err)
 		return
@@ -186,7 +168,7 @@ func tunnelTCP(local net.Conn, dataAddr, sessionID, caPath string) {
 	defer local.Close()
 	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionID[:8], local.RemoteAddr())
 
-	tlsCfg, err := loadTLSConfig(caPath)
+	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
 		log.Printf("tunnel: tls config: %v", err)
 	}

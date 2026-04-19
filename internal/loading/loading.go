@@ -47,8 +47,8 @@ func LoadMTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
 	}
 
 	return &tls.Config{
-		RootCAs:      pool,
 		Certificates: []tls.Certificate{clientCert},
 		MinVersion:   tls.VersionTLS13,
+		RootCAs:      pool,
 	}, nil
 }

@@ -131,6 +131,13 @@ func handleControl(tlsConn *tls.Conn) {
 
 	log.Printf("новое control-соединение от %s", tlsConn.RemoteAddr())
 
+	// Из-за ленивой оптимизации go может провести handshake после Accept
+	// Говорим ему сделать его прямо сейчас, тк нам нужно взять сертификат client
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("handshake failed: %v", err)
+		return
+	}
+
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		log.Printf("no client certificate")

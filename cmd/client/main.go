@@ -26,11 +26,14 @@ func main() {
 	password := flag.String("pass", "secret", "пароль")
 	machineID := flag.String("machine", "machine1", "ID машины")
 	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")
+	clientCertPath := flag.String("cert", "certs/client_cert.crt", "клиентский сертификат")
+	clientKeyPath := flag.String("key", "certs/client_key.key", "приватный ключ клиента")
 	transport := flag.String("transport", "tcp", "транспорт data plane: tcp или quic")
 	flag.Parse()
 
 	// Шаг 1: control plane — аутентификация и запрос машины
-	sessionID, err := authenticate(*serverAddr, *username, *password, *machineID, *caPath)
+	sessionID, err := authenticate(*serverAddr, *username, *password, *machineID,
+		*caPath, *clientCertPath, *clientKeyPath)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
 	}
@@ -60,8 +63,8 @@ func main() {
 }
 
 // authenticate подключается к control plane и получает адрес целевой машины
-func authenticate(serverAddr, username, password, machineID, caPath string) (string, error) {
-	tlsCfg, err := loading.LoadTLSConfig(caPath)
+func authenticate(serverAddr, username, password, machineID, caPath, clientCertPath, clientKeyPath string) (string, error) {
+	tlsCfg, err := loading.LoadMTLSConfig(caPath, clientCertPath, clientKeyPath)
 	if err != nil {
 		return "", err
 	}

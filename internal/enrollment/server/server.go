@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"rdp_zero_trust/internal/enrollment/api"
+	"rdp_zero_trust/internal/identity"
 )
 
 // AuthHandler — серверная сторона интерфейса Auth.
@@ -123,7 +124,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Проверяем соответсвие username в request на аутентификацию и в SAN CSR
-	usernameCSR, err := extractUsernameFromCSR(csr)
+	usernameCSR, err := identity.UsernameFromCSR(csr)
 	if err != nil {
 		writeError(w, "CSR SAN username empty", http.StatusBadRequest)
 		return
@@ -171,21 +172,6 @@ func (s *Server) signCSR(csr *x509.CertificateRequest) (string, error) {
 	})
 
 	return string(certPEM), nil
-}
-
-// extractUsernameFromCSR достаёт из SAN CSR username
-func extractUsernameFromCSR(csr *x509.CertificateRequest) (string, error) {
-	if len(csr.URIs) == 0 {
-		return "", fmt.Errorf("no URI in SAN")
-	}
-
-	uri := csr.URIs[0]
-
-	if uri.Scheme != "user" {
-		return "", fmt.Errorf("invalid URI scheme")
-	}
-
-	return uri.Host, nil
 }
 
 // writeError консистентно записывает ошибки в response

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -13,6 +15,7 @@ import (
 	"rdp_zero_trust/internal/admin"
 	"rdp_zero_trust/internal/config"
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
+	"rdp_zero_trust/internal/identity"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -32,6 +35,7 @@ func main() {
 	adminAddr := flag.String("admin", "127.0.0.1:9999", "адрес admin HTTP (только localhost)")
 	enrollAddr := flag.String("enroll", ":9003", "адрес enrollment сервера")
 	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
+	caCertPath := flag.String("ca-cert", "certs/ca.crt", "сертификат CA")
 	caKeyPath := flag.String("ca-key", "certs/ca.key", "приватный ключ CA")
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
@@ -68,9 +72,168 @@ func main() {
 	adminSrv := admin.NewServer(sessions)
 	go adminSrv.Start(*adminAddr)
 
-	go listenControl(*controlAddr, *certPath, *keyPath)
+	go listenControl(*controlAddr, *certPath, *keyPath, *caCertPath)
 	go listenTCPData(*dataTCPAddr, *certPath, *keyPath)
 	listenQUICData(*dataQUICAddr, *certPath, *keyPath)
+}
+
+// listenControl — принимает управляющие tcp соединения на data plane
+func listenControl(addr, certPath, keyPath, caCertPath string) {
+	// Загружаем сертификат сервера
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("tls cert: %v", err)
+	}
+
+	// Загружаем сертификат CA и создаем пул
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		log.Fatalf("read ca: %v", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("parse ca cert")
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,               // только TLS 1.3
+		ClientAuth:   tls.RequireAndVerifyClientCert, // Для соединения требовать и проверять клиентский сертификат
+		ClientCAs:    caPool,                         // Предоставляем CA который подпиал клиентский сертификат
+	}
+
+	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	if err != nil {
+		log.Fatalf("control listen: %v", err)
+	}
+	log.Printf("control plane (mTLS) слушает %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("control accept error: %v", err)
+			continue
+		}
+		// У нас tls поверх соединения - берём его
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			conn.Close()
+			log.Printf("client-control plane is not tls")
+			continue
+		}
+		go handleControl(tlsConn)
+	}
+}
+
+// handleControl — обрабатывает одного клиента на control plane
+func handleControl(tlsConn *tls.Conn) {
+	c := proto.NewConn(tlsConn)
+	defer c.Close()
+
+	log.Printf("новое control-соединение от %s", tlsConn.RemoteAddr())
+
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		log.Printf("no client certificate")
+		return
+	}
+
+	cert := state.PeerCertificates[0]
+
+	certUsername, err := identity.UsernameFromCert(cert)
+	if err != nil {
+		log.Printf("invalid certificate: %v", err)
+		return
+	}
+
+	log.Printf("control: подключился %s (из SAN)", certUsername)
+
+	// Шаг 1: HELLO <username> <password>
+	msgType, args, err := c.Recv()
+	if err != nil || msgType != proto.MsgHello || len(args) < 2 {
+		c.Send(proto.MsgError, "expected HELLO <username> <password>")
+		return
+	}
+	username, password := args[0], args[1]
+
+	// Проверка 1: SAN vs сообщение
+	if username != certUsername {
+		c.Send(proto.MsgError, "certificate username mismatch")
+		log.Printf("mTLS mismatch: cert=%s msg=%s", certUsername, username)
+		return
+	}
+
+	// Проверка 2: пароль (второй фактор)
+	if !cfg.Authenticate(username, password) {
+		c.Send(proto.MsgError, "invalid credentials")
+		log.Printf("[%s] неверный пароль", username)
+		return
+	}
+
+	log.Printf("[%s] аутентифицирован (mTLS + пароль)", username)
+	c.Send(proto.MsgOK)
+
+	// Шаг 2: CONNECT <machine_id>
+	msgType, args, err = c.Recv()
+	if err != nil || msgType != proto.MsgConnect || len(args) == 0 {
+		c.Send(proto.MsgError, "expected CONNECT <machine_id>")
+		return
+	}
+	machineID := args[0]
+
+	if !cfg.CanAccess(username, machineID) {
+		c.Send(proto.MsgError, "access denied")
+		log.Printf("[%s] нет доступа к %s", username, machineID)
+		return
+	}
+
+	targetAddr, ok := cfg.Machines[machineID]
+	if !ok {
+		c.Send(proto.MsgError, "unknown machine")
+		return
+	}
+
+	// Создаём сессию
+	sess, err := sessions.Create(username, machineID, targetAddr, sessionTTL)
+	if err != nil {
+		c.Send(proto.MsgError, "internal error")
+		log.Printf("create session: %v", err)
+		return
+	}
+
+	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
+		username, sess.ID, machineID, sessionTTL, sess.ExpiresAt.Format("15:04:05"))
+	c.Send(proto.MsgOK, sess.ID)
+
+	// Ждём одно из 3 событий:
+	// 1. TTL истёк
+	// 2. Сессия отозвана admin API
+	// 3. Клиент сам отключился
+	ttlTimer := time.NewTimer(time.Until(sess.ExpiresAt))
+	defer ttlTimer.Stop()
+
+	// Канал для отслеживания закрытия соединения клиентов
+	clientGone := make(chan struct{})
+	go func() {
+		// Блокируемся на чтении — когда клиент закроет соединение получим ошибку
+		c.Recv()
+		close(clientGone)
+	}()
+
+	select {
+	case <-ttlTimer.C:
+		log.Printf("сессия %s истекла по TTL", sess.ID)
+		c.Send(proto.MsgError, "session expired")
+
+	case <-sess.Done():
+		log.Printf("сессия %s отозвана администратором", sess.ID)
+		c.Send(proto.MsgError, "session revoked")
+
+	case <-clientGone:
+		log.Printf("сессия %s: клиент отключился", sess.ID)
+	}
+
+	sessions.Delete(sess.ID)
+	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
 // listenQUICData — принимает QUIC соединения на data plane
@@ -157,120 +320,6 @@ func handleQUIC(conn *quic.Conn) {
 	log.Printf("quic: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
 	err1, err2 := pipe.PipeWithDone(qconn, target, sess.Done())
 	log.Printf("quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
-}
-
-// listenControl — принимает управляющие tcp соединения на data plane
-func listenControl(addr, certPath, keyPath string) {
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		log.Fatalf("tls cert: %v", err)
-	}
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13, // только TLS 1.3
-	}
-
-	tcpLn, err := tls.Listen("tcp", addr, tlsCfg)
-	if err != nil {
-		log.Fatalf("control listen: %v", err)
-	}
-	log.Printf("control plane (TLS) слушает %s", addr)
-
-	for {
-		conn, err := tcpLn.Accept()
-		if err != nil {
-			log.Printf("control accept error: %v", err)
-			continue
-		}
-		go handleControl(conn)
-	}
-}
-
-// handleControl — обрабатывает одного клиента на control plane
-func handleControl(raw net.Conn) {
-	c := proto.NewConn(raw)
-	defer c.Close()
-
-	log.Printf("новое control-соединение от %s", raw.RemoteAddr())
-
-	// Шаг 1: HELLO <username> <password>
-	msgType, args, err := c.Recv()
-	if err != nil || msgType != proto.MsgHello || len(args) < 2 {
-		c.Send(proto.MsgError, "expected HELLO <username> <password>")
-		return
-	}
-	username, password := args[0], args[1]
-
-	if !cfg.Authenticate(username, password) {
-		c.Send(proto.MsgError, "invalid credentials")
-		log.Printf("[%s] неверный пароль", username)
-		return
-	}
-	log.Printf("[%s] аутентифицирован", username)
-	c.Send(proto.MsgOK)
-
-	// Шаг 2: CONNECT <machine_id>
-	msgType, args, err = c.Recv()
-	if err != nil || msgType != proto.MsgConnect || len(args) == 0 {
-		c.Send(proto.MsgError, "expected CONNECT <machine_id>")
-		return
-	}
-	machineID := args[0]
-
-	if !cfg.CanAccess(username, machineID) {
-		c.Send(proto.MsgError, "access denied")
-		log.Printf("[%s] нет доступа к %s", username, machineID)
-		return
-	}
-
-	targetAddr, ok := cfg.Machines[machineID]
-	if !ok {
-		c.Send(proto.MsgError, "unknown machine")
-		return
-	}
-
-	// Создаём сессию
-	sess, err := sessions.Create(username, machineID, targetAddr, sessionTTL)
-	if err != nil {
-		c.Send(proto.MsgError, "internal error")
-		log.Printf("create session: %v", err)
-		return
-	}
-
-	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
-		username, sess.ID, machineID, sessionTTL, sess.ExpiresAt.Format("15:04:05"))
-	c.Send(proto.MsgOK, sess.ID)
-
-	// Ждём одно из 3 событий:
-	// 1. TTL истёк
-	// 2. Сессия отозвана admin API
-	// 3. Клиент сам отключился
-	ttlTimer := time.NewTimer(time.Until(sess.ExpiresAt))
-	defer ttlTimer.Stop()
-
-	// Канал для отслеживания закрытия соединения клиентов
-	clientGone := make(chan struct{})
-	go func() {
-		// Блокируемся на чтении — когда клиент закроет соединение получим ошибку
-		c.Recv()
-		close(clientGone)
-	}()
-
-	select {
-	case <-ttlTimer.C:
-		log.Printf("сессия %s истекла по TTL", sess.ID)
-		c.Send(proto.MsgError, "session expired")
-
-	case <-sess.Done():
-		log.Printf("сессия %s отозвана администратором", sess.ID)
-		c.Send(proto.MsgError, "session revoked")
-
-	case <-clientGone:
-		log.Printf("сессия %s: клиент отключился", sess.ID)
-	}
-
-	sessions.Delete(sess.ID)
-	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
 // listenTCPData — принимает tcp data-соединения и проксирует на целевую машину

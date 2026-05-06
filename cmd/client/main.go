@@ -5,8 +5,10 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"rdp_zero_trust/internal/loading"
@@ -162,6 +164,8 @@ func tunnelQUIC(local net.Conn, quicAddr, sessionID, caPath string) {
 	}
 	log.Printf("tunnel quic: [%s] старт", sessionID[:8])
 
+	tlsCfg.KeyLogWriter = keyLogWriter("quic_keylog.txt")
+
 	err1, err2 := pipe.Pipe(qconn, local)
 	log.Printf("tunnel quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
 }
@@ -207,4 +211,14 @@ func tunnelTCP(local net.Conn, dataAddr, sessionID, caPath string) {
 	log.Printf("tunnel: [%s] старт data transfering", sessionID[:8])
 	err1, err2 := pipe.Pipe(raw, local)
 	log.Printf("tunnel: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+}
+
+// Утилита для эесперимента (временно)
+func keyLogWriter(path string) io.Writer {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		log.Printf("keylog: %v", err)
+		return nil
+	}
+	return f
 }

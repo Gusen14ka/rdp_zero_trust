@@ -72,9 +72,13 @@ start_capture() {
     fi
 
     echo "Захват трафика на порту $port -> $RESULTS_DIR/capture.pcap"
-    sudo tcpdump -i "$IFACE" port "$port" -w "$RESULTS_DIR/capture.pcap" &
+    sudo tcpdump -i "$IFACE" port "$port" \
+        -B 4096 \
+        -w "$RESULTS_DIR/capture.pcap" &
     TCPDUMP_PID=$!
     echo $TCPDUMP_PID > "$RESULTS_DIR/tcpdump.pid"
+    # Даём tcpdump время запуститься
+    sleep 1
 }
 
 # Собираем системные метрики
@@ -90,7 +94,10 @@ start_metrics() {
 
 stop_capture() {
     if [ -f "$RESULTS_DIR/tcpdump.pid" ]; then
-        sudo kill $(cat "$RESULTS_DIR/tcpdump.pid") 2>/dev/null || true
+        # SIGINT вместо SIGTERM — tcpdump корректно flush'ит буфер
+        sudo kill -SIGINT $(cat "$RESULTS_DIR/tcpdump.pid") 2>/dev/null || true
+        # Ждём пока процесс завершится
+        sleep 2
     fi
 }
 

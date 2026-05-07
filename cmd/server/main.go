@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -16,6 +17,7 @@ import (
 	"rdp_zero_trust/internal/config"
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/identity"
+	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -26,6 +28,9 @@ var (
 	cfg        *config.Config
 	sessions   *session.Store
 	sessionTTL time.Duration
+
+	// sessionMetrics хранит метрики активных сессий
+	sessionMetrics sync.Map // map[sessionID]*metrics.StreamMetrics
 )
 
 func main() {
@@ -280,53 +285,11 @@ func listenQUICData(addr, certPath, keyPath string) {
 	}
 }
 
-// handleQUIC — обрабатывает одно QUIC соединение
-// Одно соединение = один стрим = одна RDP сессия
-func handleQUIC(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "done")
-
-	// Принимаем стрим от клиента
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		log.Printf("quic accept stream: %v", err)
-		return
-	}
-	defer stream.Close()
-
-	// Дальше всё то же самое что в handleData —
-	// стрим реализует net.Conn-подобный интерфейс
-	qconn := quicconn.New(conn, stream)
-	c := proto.NewConn(qconn)
-
-	msgType, args, err := c.Recv()
-	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("quic: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
-		c.Send(proto.MsgError, "invalid session request")
-		return
-	}
-	sessionID := args[0]
-
-	sess, ok := sessions.Get(sessionID)
-	if !ok {
-		log.Printf("quic: неизвестная сессия %s", sessionID)
-		c.Send(proto.MsgError, "session not found")
-		return
-	}
-
-	target, err := net.Dial("tcp", sess.TargetAddr)
-	if err != nil {
-		log.Printf("quic: не могу подключиться к %s: %v", sess.TargetAddr, err)
-		c.Send(proto.MsgError, "target connection failed")
-		return
-	}
-	defer target.Close()
-
-	pipe.TuneConn(target)
-	c.Send(proto.MsgOK)
-
-	log.Printf("quic: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	err1, err2 := pipe.PipeWithDone(qconn, target, sess.Done())
-	log.Printf("quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+// handleData — обработка обычного TLS/TCP соединения
+func handleData(raw net.Conn) {
+	// raw уже реализует net.Conn (внутри это tls.Conn)
+	// дополнительной обёртки не требуется
+	handleDataConn(raw, "data")
 }
 
 // listenTCPData — принимает tcp data-соединения и проксирует на целевую машину
@@ -356,50 +319,85 @@ func listenTCPData(addr, certPath, keyPath string) {
 	}
 }
 
-// handleData — первая строка от клиента: SESSION <id>
-func handleData(raw net.Conn) {
-	defer raw.Close()
+// handleQUIC — обрабатывает одно QUIC соединение
+// Одно соединение = один стрим = одна RDP сессия
+func handleQUIC(conn *quic.Conn) {
+	// Закрываем QUIC соединение при выходе
+	defer conn.CloseWithError(0, "done")
 
-	// raw принятый по tls.Listen лишь реализует интерфейс net.Conn, внутри он tls.Conn
-	// Но это не проблема, тк его настройки уже заданы на клиенте
-	// Смысла в TuneConn просто нет
-	// pipe.TuneConn(raw)
+	// Принимаем стрим от клиента (в QUIC данные идут через стримы)
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("quic accept stream: %v", err)
+		return
+	}
+	defer stream.Close()
 
-	c := proto.NewConn(raw)
+	// Оборачиваем (conn + stream) в net.Conn-подобный интерфейс
+	// чтобы дальше использовать ту же логику, что и для TCP
+	qconn := quicconn.New(conn, stream)
 
+	// Передаём в общий обработчик
+	handleDataConn(qconn, "quic")
+}
+
+func handleDataConn(conn net.Conn, protoName string) {
+	defer conn.Close()
+
+	// Убираем задержки и Нейгла
+	pipe.TuneConn(conn)
+	// Оборачиваем соединение в наш протокол (чтение/запись сообщений)
+	c := proto.NewConn(conn)
+
+	// Ожидаем первое сообщение от клиента: SESSION <id>
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("data: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
+		log.Printf("%s: ожидал SESSION, получил: %v %v err=%v", protoName, msgType, args, err)
 		c.Send(proto.MsgError, "invalid session request")
 		return
 	}
 	sessionID := args[0]
 
+	// Ищем сессию, которую ранее создали на control-plane
 	sess, ok := sessions.Get(sessionID)
 	if !ok {
-		log.Printf("data: неизвестная сессия %s", sessionID)
+		log.Printf("%s: неизвестная сессия %s", protoName, sessionID)
 		c.Send(proto.MsgError, "session not found")
 		return
 	}
 
-	log.Printf("data: [%s] НАЧАЛО - подключение -> %s", sessionID[:8], sess.TargetAddr)
+	log.Printf("%s: [%s] старт -> %s", protoName, sessionID[:8], sess.TargetAddr)
 
+	// Подключаемся к целевой машине (RDP сервер или любой TCP target)
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
-		log.Printf("data: не могу подключиться к %s: %v", sess.TargetAddr, err)
+		log.Printf("%s: не могу подключиться к %s: %v", protoName, sess.TargetAddr, err)
 		c.Send(proto.MsgError, "target connection failed")
 		return
 	}
 	defer target.Close()
 
-	// target по tcp и он реально *net.TCPConn
+	// Оптимизируем TCP-соединение (nodelay, буферы и т.п.)
 	pipe.TuneConn(target)
 
-	// Отправляем подтверждение: сервер готов к передаче RDP данных
+	// Создаём коллектор метрик для этой сессии
+	// Измеряем входящий трафик (клиент → сервер)
+	// Обоснование: участок сервер → машина симметричен и находится
+	// в локальной сети без деградации (см. методологию)
+	m := metrics.NewStreamMetrics()
+	sessionMetrics.Store(sessionID, m)
+	defer sessionMetrics.Delete(sessionID)
+
+	// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
 	c.Send(proto.MsgOK)
 
-	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	// После handshake буфер reader пуст — передаём raw напрямую
-	err1, err2 := pipe.PipeWithDone(raw, target, sess.Done())
-	log.Printf("data: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+	// MeteredReader прозрачно считает метрики входящего потока
+	meteredRaw := metrics.NewMeteredConn(conn, m)
+
+	// Дальше просто проксируем трафик в обе стороны до завершения сессии
+	// conn — клиент (TLS или QUIC)
+	// target — целевой сервер
+	err1, err2 := pipe.PipeWithDone(meteredRaw, target, sess.Done())
+
+	log.Printf("%s: [%s] завершено err1=%v err2=%v", protoName, sessionID[:8], err1, err2)
 }

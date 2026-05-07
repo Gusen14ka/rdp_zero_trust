@@ -8,7 +8,7 @@ set -e
 SCENARIO=$1    # baseline, loss_1, loss_2, loss_5, jitter, bandwidth, combo
 TRANSPORT=$2   # tcp, quic
 DURATION=$3    # секунды
-IFACE=${4:-eth0}  # сетевой интерфейс, по умолчанию eth0
+IFACE=${4:-enp0s3}  # сетевой интерфейс, по умолчанию enp0s3
 
 RESULTS_DIR="results/$(date +%Y%m%d_%H%M%S)_${SCENARIO}_${TRANSPORT}"
 mkdir -p "$RESULTS_DIR"
@@ -72,12 +72,13 @@ start_capture() {
     fi
 
     echo "Захват трафика на порту $port -> $RESULTS_DIR/capture.pcap"
-    sudo tcpdump -i "$IFACE" port "$port" \
-        -B 4096 \
-        -w "$RESULTS_DIR/capture.pcap" &
+
+    sudo bash -c "exec tcpdump -i '$IFACE' port '$port' \
+        -U -s 0 -B 4096 \
+        -w '$RESULTS_DIR/capture.pcap'" &
     TCPDUMP_PID=$!
+
     echo $TCPDUMP_PID > "$RESULTS_DIR/tcpdump.pid"
-    # Даём tcpdump время запуститься
     sleep 1
 }
 
@@ -94,10 +95,11 @@ start_metrics() {
 
 stop_capture() {
     if [ -f "$RESULTS_DIR/tcpdump.pid" ]; then
-        # SIGINT вместо SIGTERM — tcpdump корректно flush'ит буфер
-        sudo kill -SIGINT $(cat "$RESULTS_DIR/tcpdump.pid") 2>/dev/null || true
-        # Ждём пока процесс завершится
-        sleep 2
+        local pid
+        pid=$(cat "$RESULTS_DIR/tcpdump.pid")
+
+        sudo kill -INT "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
     fi
 }
 

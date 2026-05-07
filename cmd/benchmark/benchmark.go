@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -129,6 +131,10 @@ func main() {
 		Sent:      sentResult,
 		Received:  serverSnap,
 	}
+	// Создаём папку если не существует
+	if err := os.MkdirAll(filepath.Dir(*outPath), 0755); err != nil {
+		log.Fatalf("mkdir: %v", err)
+	}
 
 	if err := result.Save(*outPath); err != nil {
 		log.Fatalf("save result: %v", err)
@@ -171,7 +177,7 @@ func authenticate(serverAddr, username, password, machineID, caPath, certPath, k
 		return "", nil, fmt.Errorf("hello rejected")
 	}
 
-	c.Send(proto.MsgConnect, machineID)
+	c.Send(proto.MsgBench, "benchmark")
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
 		raw.Close()

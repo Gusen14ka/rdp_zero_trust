@@ -74,7 +74,7 @@ func main() {
 	}()
 
 	// Запускаем admin HTTP сервер
-	adminSrv := admin.NewServer(sessions)
+	adminSrv := admin.NewServer(sessions, &sessionMetrics)
 	go adminSrv.Start(*adminAddr)
 
 	go listenControl(*controlAddr, *certPath, *keyPath, *caCertPath)

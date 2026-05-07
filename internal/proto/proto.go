@@ -12,6 +12,7 @@ import (
 const (
 	MsgHello   = "HELLO"
 	MsgConnect = "CONNECT"
+	MsgBench   = "BENCH"
 	MsgSession = "SESSION"
 	MsgOK      = "OK"
 	MsgError   = "ERROR"

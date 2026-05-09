@@ -41,6 +41,11 @@ func main() {
 	scenario := flag.String("scenario", "baseline", "название сценария для лога")
 	transport := flag.String("transport", "tcp", "транспорт: tcp или quic")
 	outPath := flag.String("out", "result.json", "путь для сохранения результата")
+	// Параметры сетевой эмуляции
+	lossPct := flag.Float64("loss", 0, "потери пакетов в процентах")
+	delayMs := flag.Int("delay", 0, "задержка в миллисекундах")
+	jitterMs := flag.Int("jitter", 0, "джиттер в миллисекундах")
+	rateMbit := flag.Float64("rate", 0, "ограничение bandwidth в Mbit/s")
 	flag.Parse()
 
 	// Выбираем паттерн
@@ -55,10 +60,17 @@ func main() {
 	log.Printf("сценарий:  %s", *scenario)
 	log.Printf("длительность: %v", pat.Duration)
 
+	benchParams := proto.BenchParams{
+		LossPct:  *lossPct,
+		DelayMs:  *delayMs,
+		JitterMs: *jitterMs,
+		RateMbit: *rateMbit,
+	}
+
 	// Шаг 1: аутентификация через control plane
 	sessionID, ctrlConn, err := authenticate(
 		*serverAddr, *username, *password, *machineID,
-		*caPath, *certPath, *keyPath,
+		*caPath, *certPath, *keyPath, benchParams,
 	)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
@@ -156,7 +168,7 @@ func selectPattern(name string) (benchmark.TrafficPattern, error) {
 
 // authenticate проходит аутентификацию и возвращает sessionID и control соединение.
 // Соединение намеренно не закрываем — держим сессию живой на время benchmark.
-func authenticate(serverAddr, username, password, machineID, caPath, certPath, keyPath string) (string, io.Closer, error) {
+func authenticate(serverAddr, username, password, machineID, caPath, certPath, keyPath string, benchParams proto.BenchParams) (string, io.Closer, error) {
 	tlsCfg, err := loading.LoadMTLSConfig(caPath, certPath, keyPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("tls config: %w", err)
@@ -177,7 +189,7 @@ func authenticate(serverAddr, username, password, machineID, caPath, certPath, k
 		return "", nil, fmt.Errorf("hello rejected")
 	}
 
-	c.Send(proto.MsgBench, "benchmark")
+	c.Send(proto.MsgBench, benchParams.Encode())
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
 		raw.Close()

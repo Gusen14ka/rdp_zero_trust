@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/identity"
 	"rdp_zero_trust/internal/metrics"
+	"rdp_zero_trust/internal/netem"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -27,10 +29,12 @@ import (
 var (
 	cfg        *config.Config
 	sessions   *session.Store
-	sessionTTL time.Duration
+	sessionTtl time.Duration
 
 	// sessionMetrics хранит метрики активных сессий
 	sessionMetrics sync.Map // map[sessionID]*metrics.StreamMetrics
+
+	netCtrl *netem.Controller
 )
 
 func main() {
@@ -45,9 +49,10 @@ func main() {
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
 	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
+	netIface := flag.String("iface", "enp0s3", "сетевой интерфейс для tc netem")
 	flag.Parse()
 
-	sessionTTL = *ttl
+	sessionTtl = *ttl
 
 	// Запускаем оба листенера параллельно
 	var err error
@@ -58,6 +63,8 @@ func main() {
 	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
 
 	sessions = session.NewStore()
+
+	netCtrl = netem.New(*netIface)
 
 	// Enrollment сервер
 	enrollSrv, err := enrollServer.NewServer(*caKeyPath, "certs/ca.crt")
@@ -184,7 +191,7 @@ func handleControl(tlsConn *tls.Conn) {
 	log.Printf("[%s] аутентифицирован (mTLS + пароль)", username)
 	c.Send(proto.MsgOK)
 
-	// Шаг 2: CONNECT <machine_id> или BENCH
+	// Шаг 2: CONNECT <machine_id> или BENCH <net params>
 	msgType, args, err = c.Recv()
 	if err != nil {
 		c.Send(proto.MsgError, "read error")
@@ -193,15 +200,15 @@ func handleControl(tlsConn *tls.Conn) {
 
 	switch msgType {
 	case proto.MsgConnect:
-		handleConnectRequest(c, args, username, sessionTTL)
+		handleConnectRequest(c, args, username)
 	case proto.MsgBench:
-		handleBenchRequest(c, username)
+		handleBenchRequest(c, args, username)
 	default:
-		c.Send(proto.MsgError, "expected CONNECT or BENCH")
+		c.Send(proto.MsgError, fmt.Sprintf("expected CONNECT or BENCH, got %s", msgType))
 	}
 }
 
-func handleConnectRequest(c *proto.Conn, args []string, username string, ttl time.Duration) {
+func handleConnectRequest(c *proto.Conn, args []string, username string) {
 	if len(args) == 0 {
 		c.Send(proto.MsgError, "expected CONNECT <machine_id>")
 		return
@@ -221,14 +228,14 @@ func handleConnectRequest(c *proto.Conn, args []string, username string, ttl tim
 	}
 
 	// Создаём сессию
-	sess, err := sessions.Create(username, machineID, targetAddr, ttl)
+	sess, err := sessions.Create(username, machineID, targetAddr, sessionTtl)
 	if err != nil {
 		c.Send(proto.MsgError, "internal error")
 		return
 	}
 
 	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
-		username, sess.ID, machineID, ttl, sess.ExpiresAt.Format("15:04:05"))
+		username, sess.ID, machineID, sessionTtl, sess.ExpiresAt.Format("15:04:05"))
 	c.Send(proto.MsgOK, sess.ID)
 
 	// Ждём одно из 3 событий:
@@ -261,9 +268,30 @@ func handleConnectRequest(c *proto.Conn, args []string, username string, ttl tim
 	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
-func handleBenchRequest(c *proto.Conn, username string) {
+func handleBenchRequest(c *proto.Conn, args []string, username string) {
+	// Парсим сетевые параметры
+	// Формат: BENCH loss=2.00,delay=50,jitter=20,rate=0.00
+	benchParams, err := proto.DecodeBenchParams(args[0])
+	if err != nil {
+		c.Send(proto.MsgError, fmt.Sprintf("invalid bench params: %v", err))
+		return
+	}
+
+	// Применяем сетевые условия
+	netParams := netem.NetParams{
+		LossPct:  benchParams.LossPct,
+		DelayMs:  benchParams.DelayMs,
+		JitterMs: benchParams.JitterMs,
+		RateMbit: benchParams.RateMbit,
+	}
+
+	if err := netCtrl.Apply(netParams); err != nil {
+		c.Send(proto.MsgError, fmt.Sprintf("netem apply: %v", err))
+		return
+	}
+
 	// Создаём benchmark сессию — без привязки к машине
-	sess, err := sessions.Create(username, "benchmark", "benchmark", sessionTTL)
+	sess, err := sessions.Create(username, "benchmark", "benchmark", sessionTtl)
 	if err != nil {
 		c.Send(proto.MsgError, "internal error")
 		return
@@ -285,6 +313,9 @@ func handleBenchRequest(c *proto.Conn, username string) {
 	case <-clientGone:
 		log.Printf("benchmark сессия %s завершена", sess.ID)
 	}
+
+	// Сбрасываем сетевые условия после завершения
+	netCtrl.Reset()
 
 	sessions.Delete(sess.ID)
 }

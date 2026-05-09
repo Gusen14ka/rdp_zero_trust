@@ -30,14 +30,15 @@ type StreamMetrics struct {
 	rawArrFull  bool
 
 	// benchmarkSamples — синтетические пакеты с известным timestamp
-	benchPackets  int64
-	benchBytes    int64
-	benchLatency  []float64
-	benchLatIdx   int
-	benchLatFull  bool
-	benchArrivals []float64
-	benchArrIdx   int
-	benchArrFull  bool
+	benchPackets          int64
+	benchBytes            int64
+	benchLatency          []float64
+	benchLatIdx           int
+	benchLatFull          bool
+	benchArrivals         []float64
+	benchArrIdx           int
+	benchArrFull          bool
+	benchExpectedInterval float64
 }
 
 func NewStreamMetrics() *StreamMetrics {
@@ -79,8 +80,20 @@ func (m *StreamMetrics) RecordBenchmark(latency time.Duration, bytes int) {
 
 	// Jitter между benchmark пакетами
 	if !m.lastPacket.IsZero() {
-		interval := float64(now.Sub(m.lastPacket).Milliseconds())
-		m.benchArrivals[m.benchArrIdx] = interval
+		actualInterval := float64(now.Sub(m.lastPacket).Milliseconds())
+		var jitter float64
+		if m.benchExpectedInterval > 0 {
+			// Истинный jitter — отклонение от ожидаемого интервала
+			jitter = actualInterval - m.benchExpectedInterval
+			if jitter < 0 {
+				jitter = -jitter
+			}
+		} else {
+			// Если интервал не задан — просто inter-arrival time
+			jitter = actualInterval
+		}
+
+		m.benchArrivals[m.benchArrIdx] = jitter
 		m.benchArrIdx = (m.benchArrIdx + 1) % maxSamples
 		if m.benchArrIdx == 0 {
 			m.benchArrFull = true
@@ -133,6 +146,16 @@ func (m *StreamMetrics) Snapshot() Snapshot {
 			Jitter:          calcStats(activeSlice(m.benchArrivals, m.benchArrIdx, m.benchArrFull)),
 		},
 	}
+}
+
+// SetExpectedInterval задаёт ожидаемый интервал между пакетами.
+// Должен вызываться до начала приёма данных.
+// Используется для расчёта истинного jitter как отклонения
+// от ожидаемого интервала, а не самого интервала.
+func (m *StreamMetrics) SetExpectedInterval(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.benchExpectedInterval = float64(d.Milliseconds())
 }
 
 // activeSlice возвращает актуальные данные из ring buffer в правильном порядке

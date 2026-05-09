@@ -15,6 +15,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"rdp_zero_trust/internal/admin"
+	"rdp_zero_trust/internal/benchproto"
 	"rdp_zero_trust/internal/config"
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/identity"
@@ -271,7 +272,7 @@ func handleConnectRequest(c *proto.Conn, args []string, username string) {
 func handleBenchRequest(c *proto.Conn, args []string, username string) {
 	// Парсим сетевые параметры
 	// Формат: BENCH loss=2.00,delay=50,jitter=20,rate=0.00
-	benchParams, err := proto.DecodeBenchParams(args[0])
+	benchParams, err := benchproto.DecodeBenchParams(args[0])
 	if err != nil {
 		c.Send(proto.MsgError, fmt.Sprintf("invalid bench params: %v", err))
 		return
@@ -291,7 +292,7 @@ func handleBenchRequest(c *proto.Conn, args []string, username string) {
 	}
 
 	// Создаём benchmark сессию — без привязки к машине
-	sess, err := sessions.Create(username, "benchmark", "benchmark", sessionTtl)
+	sess, err := sessions.CreateBench(username, sessionTtl, benchParams.ClientIntervalMs)
 	if err != nil {
 		c.Send(proto.MsgError, "internal error")
 		return
@@ -484,6 +485,11 @@ func handleDataConn(conn net.Conn, protoName string) {
 // принимает уже созданный proto.Conn
 func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, sessionID string) {
 	m := metrics.NewStreamMetrics()
+	if sess.BenchClientIntervalMs > 0 {
+		m.SetExpectedInterval(
+			time.Duration(sess.BenchClientIntervalMs) * time.Millisecond,
+		)
+	}
 	sessionMetrics.Store(sessionID, m)
 	defer sessionMetrics.Delete(sessionID)
 

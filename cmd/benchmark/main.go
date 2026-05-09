@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"rdp_zero_trust/internal/benchmark"
+	"rdp_zero_trust/internal/benchproto"
 	"rdp_zero_trust/internal/loading"
 	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/pipe"
@@ -60,11 +61,12 @@ func main() {
 	log.Printf("сценарий:  %s", *scenario)
 	log.Printf("длительность: %v", pat.Duration)
 
-	benchParams := proto.BenchParams{
-		LossPct:  *lossPct,
-		DelayMs:  *delayMs,
-		JitterMs: *jitterMs,
-		RateMbit: *rateMbit,
+	benchParams := benchproto.BenchParams{
+		LossPct:          *lossPct,
+		DelayMs:          *delayMs,
+		JitterMs:         *jitterMs,
+		RateMbit:         *rateMbit,
+		ClientIntervalMs: int(pat.ClientPacketInterval.Milliseconds()),
 	}
 
 	// Шаг 1: аутентификация через control plane
@@ -168,7 +170,7 @@ func selectPattern(name string) (benchmark.TrafficPattern, error) {
 
 // authenticate проходит аутентификацию и возвращает sessionID и control соединение.
 // Соединение намеренно не закрываем — держим сессию живой на время benchmark.
-func authenticate(serverAddr, username, password, machineID, caPath, certPath, keyPath string, benchParams proto.BenchParams) (string, io.Closer, error) {
+func authenticate(serverAddr, username, password, machineID, caPath, certPath, keyPath string, benchParams benchproto.BenchParams) (string, io.Closer, error) {
 	tlsCfg, err := loading.LoadMTLSConfig(caPath, certPath, keyPath)
 	if err != nil {
 		return "", nil, fmt.Errorf("tls config: %w", err)
@@ -193,7 +195,7 @@ func authenticate(serverAddr, username, password, machineID, caPath, certPath, k
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
 		raw.Close()
-		return "", nil, fmt.Errorf("connect rejected")
+		return "", nil, fmt.Errorf("connect rejected: %w", err)
 	}
 
 	return args[0], raw, nil

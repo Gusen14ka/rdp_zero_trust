@@ -21,6 +21,10 @@ type Session struct {
 	// cancel закрывается когда сессия должна завершиться —
 	// control plane горутина читает из него и рвёт соединение
 	cancel chan struct{}
+
+	// BenchClientIntervalMs — ожидаемый интервал между пакетами клиента.
+	// Заполняется только для benchmark сессий, для обычных = 0.
+	BenchClientIntervalMs int
 }
 
 // Cancel принудительно завершает сессию
@@ -64,6 +68,32 @@ func (s *Store) Create(username, machineID, targetAddr string, ttl time.Duration
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(ttl),
 		cancel:     make(chan struct{}),
+	}
+
+	s.mu.Lock()
+	s.sessions[id] = sess
+	s.mu.Unlock()
+
+	return sess, nil
+}
+
+// CreateBench создаёт benchmark сессию с дополнительными параметрами.
+func (s *Store) CreateBench(username string, ttl time.Duration, clientIntervalMs int) (*Session, error) {
+	id, err := randomID()
+	if err != nil {
+		return nil, fmt.Errorf("generate session id: %w", err)
+	}
+
+	now := time.Now()
+	sess := &Session{
+		ID:                    id,
+		Username:              username,
+		MachineID:             "benchmark",
+		TargetAddr:            "benchmark",
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(ttl),
+		cancel:                make(chan struct{}),
+		BenchClientIntervalMs: clientIntervalMs,
 	}
 
 	s.mu.Lock()

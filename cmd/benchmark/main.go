@@ -193,9 +193,13 @@ func authenticate(serverAddr, username, password, machineID, caPath, certPath, k
 
 	c.Send(proto.MsgBench, benchParams.Encode())
 	msgType, args, err := c.Recv()
-	if err != nil || msgType != proto.MsgOK || len(args) == 0 {
+	if err != nil || msgType != proto.MsgOK {
 		raw.Close()
-		return "", nil, fmt.Errorf("connect rejected: %w", err)
+		if len(args) == 0 {
+			return "", nil, fmt.Errorf("connect rejected: %w", err)
+		} else {
+			return "", nil, fmt.Errorf("connect rejected: %s", args[0])
+		}
 	}
 
 	return args[0], raw, nil

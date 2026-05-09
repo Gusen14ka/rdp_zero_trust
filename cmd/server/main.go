@@ -389,7 +389,7 @@ func listenQuicData(addr, certPath, keyPath string) {
 func handleTcpData(raw net.Conn) {
 	// raw уже реализует net.Conn (внутри это tls.Conn)
 	// дополнительной обёртки не требуется
-	handleDataConn(raw, "data")
+	handleDataConn(raw, "tcp")
 }
 
 // handleQUIC — обрабатывает одно QUIC соединение

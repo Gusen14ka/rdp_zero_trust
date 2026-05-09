@@ -36,7 +36,7 @@ type BenchParams struct {
 // Encode сериализует параметры в строку для передачи через proto.Send
 // Формат: "loss=2.0,delay=50,jitter=20,rate=0"
 func (p BenchParams) Encode() string {
-	return fmt.Sprintf("loss=%.2f,delay=%d,jitter=%d,rate=%.2f, interval=%d",
+	return fmt.Sprintf("loss=%.2f,delay=%d,jitter=%d,rate=%.2f,interval=%d",
 		p.LossPct, p.DelayMs, p.JitterMs, p.RateMbit, p.ClientIntervalMs)
 }
 

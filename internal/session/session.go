@@ -61,13 +61,14 @@ func (s *Store) Create(username, machineID, targetAddr string, ttl time.Duration
 
 	now := time.Now()
 	sess := &Session{
-		ID:         id,
-		Username:   username,
-		MachineID:  machineID,
-		TargetAddr: targetAddr,
-		CreatedAt:  now,
-		ExpiresAt:  now.Add(ttl),
-		cancel:     make(chan struct{}),
+		ID:                    id,
+		Username:              username,
+		MachineID:             machineID,
+		TargetAddr:            targetAddr,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(ttl),
+		cancel:                make(chan struct{}),
+		BenchClientIntervalMs: 0,
 	}
 
 	s.mu.Lock()

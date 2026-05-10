@@ -24,21 +24,17 @@ type TrafficPattern struct {
 }
 
 var (
-	// PatternIdle — пользователь не активен, смотрит на экран.
-	// Bandwidth: ~5-10 Kbit/s
-	// Источник: типичный измеренный RDP idle трафик
+	// PatternIdle — пользователь не активен
 	PatternIdle = TrafficPattern{
 		Name:                 "idle",
 		ClientPacketSize:     20,
 		ClientPacketInterval: 5 * time.Second,
 		ServerPacketSize:     500,
 		ServerPacketInterval: 3 * time.Second,
-		Duration:             60 * time.Second,
+		Duration:             30 * time.Second,
 	}
 
-	// PatternInput — активная работа: печать текста, движение мыши.
-	// Mouse Event PDU каждые 50ms, bitmap update каждые 33ms (30fps).
-	// Bandwidth: ~100-500 Kbit/s
+	// PatternInput — активная работа: мышь + клавиатура + 30fps
 	PatternInput = TrafficPattern{
 		Name:                 "input",
 		ClientPacketSize:     30,
@@ -48,10 +44,7 @@ var (
 		Duration:             60 * time.Second,
 	}
 
-	// PatternScroll — интенсивная графика: скроллинг, анимации.
-	// Полное обновление экрана каждые 16ms (60fps).
-	// 1080p сжатый RDP ~10-12KB на кадр.
-	// Bandwidth: ~1-5 Mbit/s
+	// PatternScroll — интенсивный скроллинг, 60fps
 	PatternScroll = TrafficPattern{
 		Name:                 "scroll",
 		ClientPacketSize:     20,
@@ -61,5 +54,33 @@ var (
 		Duration:             60 * time.Second,
 	}
 
-	AllPatterns = []TrafficPattern{PatternIdle, PatternInput, PatternScroll}
+	// PatternVideo — RemoteFX / видео поток, максимальная нагрузка
+	// Источник: RDP с включённым RemoteFX ~8-15 Mbit/s
+	PatternVideo = TrafficPattern{
+		Name:                 "video",
+		ClientPacketSize:     30,
+		ClientPacketInterval: 16 * time.Millisecond,
+		ServerPacketSize:     32 * 1024, // 32KB — сжатый видеокадр
+		ServerPacketInterval: 16 * time.Millisecond,
+		Duration:             60 * time.Second,
+	}
+
+	// PatternBurst — пакетная нагрузка: чередование активности и тишины
+	// Имитирует открытие приложений, переключение окон
+	PatternBurst = TrafficPattern{
+		Name:                 "burst",
+		ClientPacketSize:     50,
+		ClientPacketInterval: 100 * time.Millisecond,
+		ServerPacketSize:     64 * 1024, // 64KB — максимальный burst
+		ServerPacketInterval: 100 * time.Millisecond,
+		Duration:             60 * time.Second,
+	}
+
+	AllPatterns = []TrafficPattern{
+		PatternIdle,
+		PatternInput,
+		PatternScroll,
+		PatternVideo,
+		PatternBurst,
+	}
 )

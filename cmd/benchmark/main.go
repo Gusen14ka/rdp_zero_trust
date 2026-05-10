@@ -112,6 +112,8 @@ func main() {
 		sentResult = benchmark.RunSender(ctx, dataConn,
 			pat.ClientPacketSize, pat.ClientPacketInterval)
 		log.Printf("sender завершён: отправлено %d пакетов", sentResult.PacketsSent)
+		// Sender завершён — закрываем соединение чтобы разблокировать receiver
+		dataConn.Close()
 	}()
 
 	// Направление server → client (echo): считаем RTT
@@ -124,6 +126,10 @@ func main() {
 	}()
 
 	wg.Wait()
+
+	// После завершения контекста закрываем соединение
+	// чтобы разблокировать io.ReadFull в RunReceiver
+	//dataConn.Close()
 
 	actualDuration := time.Since(startedAt)
 	log.Printf("benchmark завершён за %v", actualDuration)

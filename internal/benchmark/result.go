@@ -26,10 +26,6 @@ type Result struct {
 	// Latency здесь = RTT (round-trip time).
 	// Это основная метрика для сравнения TCP vs QUIC.
 	ClientMetrics metrics.Snapshot `json:"client_metrics"`
-
-	// ServerMetrics — throughput и jitter на сервере.
-	// Latency в серверных метриках теперь не используется.
-	ServerMetrics metrics.Snapshot `json:"server_metrics"`
 }
 
 // Save сохраняет результат в JSON файл.

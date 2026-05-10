@@ -31,7 +31,7 @@ func main() {
 	serverAddr := flag.String("server", "192.168.0.21:9000", "адрес control plane")
 	dataAddr := flag.String("data", "192.168.0.21:9001", "адрес data plane TCP")
 	quicAddr := flag.String("quic", "192.168.0.21:9002", "адрес data plane QUIC")
-	adminAddr := flag.String("admin", "192.168.0.21:9999", "адрес admin HTTP")
+	//adminAddr := flag.String("admin", "192.168.0.21:9999", "адрес admin HTTP")
 	caPath := flag.String("ca", "certs/ca.crt", "CA сертификат")
 	certPath := flag.String("cert", "certs/client_cert.crt", "клиентский сертификат")
 	keyPath := flag.String("key", "certs/client_key.key", "приватный ключ")
@@ -135,12 +135,12 @@ func main() {
 	log.Printf("benchmark завершён за %v", actualDuration)
 
 	// Шаг 4: получаем серверные метрики через admin API
-	log.Printf("получаем метрики с сервера...")
-	serverSnap, err := fetchServerMetrics(*adminAddr, sessionID)
-	if err != nil {
-		log.Printf("не удалось получить серверные метрики: %v", err)
-		// Не фатально — сохраняем что есть
-	}
+	// log.Printf("получаем метрики с сервера...")
+	// serverSnap, err := fetchServerMetrics(*adminAddr, sessionID)
+	// if err != nil {
+	// 	log.Printf("не удалось получить серверные метрики: %v", err)
+	// 	// Не фатально — сохраняем что есть
+	// }
 
 	// Шаг 5: сохраняем результат
 	result := &benchmark.Result{
@@ -151,7 +151,6 @@ func main() {
 		Duration:      actualDuration.String(),
 		Sent:          sentResult,
 		ClientMetrics: clientMetrics.Snapshot(), // RTT здесь
-		ServerMetrics: serverSnap,               // throughput и jitter здесь
 	}
 	// Создаём папку если не существует
 	if err := os.MkdirAll(filepath.Dir(*outPath), 0755); err != nil {
@@ -335,9 +334,9 @@ func printSummary(result *benchmark.Result, outPath string) {
 	)
 
 	// Throughput с сервера
-	s := result.ServerMetrics
-	fmt.Println("--- Throughput (сервер) ---")
-	fmt.Printf("%.2f KB/s\n\n", s.ThroughputBps/1024)
+	// s := result.ServerMetrics
+	// fmt.Println("--- Throughput (сервер) ---")
+	// fmt.Printf("%.2f KB/s\n\n", s.ThroughputBps/1024)
 
 	// Loss rate
 	lossRate := float64(0)

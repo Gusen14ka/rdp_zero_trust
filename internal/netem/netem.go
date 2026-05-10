@@ -52,18 +52,33 @@ func (c *Controller) Apply(params NetParams) error {
 
 // Reset сбрасывает все правила tc на интерфейсе
 func (c *Controller) Reset() error {
-	err := c.reset()
+	c.reset()
+
+	// Восстанавливаем fq_codel — дефолтный qdisc Ubuntu
+	// без него буферизация пакетов хуже
+	cmd := exec.Command("sudo", "tc", "qdisc", "add", "dev", c.iface,
+		"root", "fq_codel")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("netem reset (ignored): %v", err)
+		log.Printf("netem: не удалось восстановить fq_codel: %s", out)
+	} else {
+		log.Printf("netem: fq_codel восстановлен")
 	}
-	log.Printf("netem: правила сброшены")
 	return nil
 }
 
 func (c *Controller) reset() error {
+	// Удаляем root qdisc — это удалит всё включая fq_codel
 	cmd := exec.Command("sudo", "tc", "qdisc", "del", "dev", c.iface, "root")
 	out, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "No such file") {
+	if err != nil {
+		// "Cannot delete" или "No such file" — значит уже пусто, это нормально
+		outStr := string(out)
+		if strings.Contains(outStr, "Cannot delete") ||
+			strings.Contains(outStr, "No such file") ||
+			strings.Contains(outStr, "RTNETLINK answers: No such file") {
+			return nil
+		}
 		return fmt.Errorf("%w: %s", err, out)
 	}
 	return nil

@@ -22,9 +22,14 @@ type Result struct {
 	// Метрики отправителя (клиентская сторона)
 	Sent SenderResult `json:"sent"`
 
-	// Метрики получателя (серверная сторона через admin API)
-	// Снимается в конце прогона через GET /sessions/{id}/metrics
-	Received metrics.Snapshot `json:"received"`
+	// ClientMetrics — RTT и jitter измеренные на клиенте.
+	// Latency здесь = RTT (round-trip time).
+	// Это основная метрика для сравнения TCP vs QUIC.
+	ClientMetrics metrics.Snapshot `json:"client_metrics"`
+
+	// ServerMetrics — throughput и jitter на сервере.
+	// Latency в серверных метриках теперь не используется.
+	ServerMetrics metrics.Snapshot `json:"server_metrics"`
 }
 
 // Save сохраняет результат в JSON файл.

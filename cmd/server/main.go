@@ -496,6 +496,8 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 	c.Send(proto.MsgOK)
 	log.Printf("bench: [%s] старт", sessionID[:8])
 
+	// Буфер для чтения пакетов
+	// Используем MeteredConn для подсчёта байт и jitter
 	meteredRaw := metrics.NewMeteredConn(raw, m)
 	buf := make([]byte, 32*1024)
 	for {
@@ -506,13 +508,22 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 		default:
 		}
 		raw.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, err := meteredRaw.Read(buf)
+		n, err := meteredRaw.Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
 			log.Printf("bench: [%s] завершено: %v", sessionID[:8], err)
 			return
+		}
+
+		// Echo — отправляем пакет обратно клиенту без изменений.
+		// Клиент по timestamp внутри пакета посчитает RTT.
+		// Используем raw (не meteredRaw) чтобы не считать echo как входящий трафик.
+		if n > 0 {
+			raw.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			raw.Write(buf[:n])
+			raw.SetWriteDeadline(time.Time{})
 		}
 	}
 }

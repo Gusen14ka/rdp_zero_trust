@@ -95,7 +95,10 @@ func main() {
 
 	// Локальные метрики клиентской стороны — для направления server→client
 	// Сервер сам считает направление client→server через MeteredConn
-	//clientMetrics := metrics.NewStreamMetrics()
+	clientMetrics := metrics.NewStreamMetrics()
+	if pat.ClientPacketInterval > 0 {
+		clientMetrics.SetExpectedInterval(pat.ClientPacketInterval)
+	}
 
 	var wg sync.WaitGroup
 	var sentResult benchmark.SenderResult
@@ -111,19 +114,17 @@ func main() {
 		log.Printf("sender завершён: отправлено %d пакетов", sentResult.PacketsSent)
 	}()
 
-	// Направление server → client: читаем что сервер нам шлёт
-	// В benchmark режиме сервер проксирует наши пакеты на машину и обратно —
-	// мы видим echo. Метрики этого направления считаем локально.
-	// wg.Add(1)
-	// go func() {
-	// 	defer wg.Done()
-	// 	log.Printf("receiver старт")
-	// 	benchmark.RunReceiver(ctx, dataConn, clientMetrics)
-	// 	log.Printf("receiver завершён: получено %d пакетов",
-	// 		clientMetrics.PacketsReceived)
-	// }()
+	// Направление server → client (echo): считаем RTT
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("receiver старт (RTT)")
+		benchmark.RunReceiver(ctx, dataConn, clientMetrics)
+		log.Printf("receiver завершён: получено %d echo", clientMetrics.PacketsReceived)
+	}()
 
 	wg.Wait()
+
 	actualDuration := time.Since(startedAt)
 	log.Printf("benchmark завершён за %v", actualDuration)
 
@@ -137,13 +138,14 @@ func main() {
 
 	// Шаг 5: сохраняем результат
 	result := &benchmark.Result{
-		Pattern:   pat.Name,
-		Transport: *transport,
-		Scenario:  *scenario,
-		StartedAt: startedAt,
-		Duration:  actualDuration.String(),
-		Sent:      sentResult,
-		Received:  serverSnap,
+		Pattern:       pat.Name,
+		Transport:     *transport,
+		Scenario:      *scenario,
+		StartedAt:     startedAt,
+		Duration:      actualDuration.String(),
+		Sent:          sentResult,
+		ClientMetrics: clientMetrics.Snapshot(), // RTT здесь
+		ServerMetrics: serverSnap,               // throughput и jitter здесь
 	}
 	// Создаём папку если не существует
 	if err := os.MkdirAll(filepath.Dir(*outPath), 0755); err != nil {
@@ -155,7 +157,7 @@ func main() {
 	}
 
 	// Печатаем краткую сводку
-	//printSummary(result, clientMetrics.Snapshot(), *outPath)
+	printSummary(result, *outPath)
 }
 
 func selectPattern(name string) (benchmark.TrafficPattern, error) {
@@ -294,48 +296,53 @@ func fetchServerMetrics(adminAddr, sessionID string) (metrics.Snapshot, error) {
 }
 
 // printSummary печатает краткую сводку результатов в консоль.
-func printSummary(result *benchmark.Result, clientSnap metrics.Snapshot, outPath string) {
+func printSummary(result *benchmark.Result, outPath string) {
 	fmt.Println("\n=== Результаты ===")
-	fmt.Printf("паттерн:   %s\n", result.Pattern)
-	fmt.Printf("транспорт: %s\n", result.Transport)
-	fmt.Printf("сценарий:  %s\n", result.Scenario)
+	fmt.Printf("паттерн:      %s\n", result.Pattern)
+	fmt.Printf("транспорт:    %s\n", result.Transport)
+	fmt.Printf("сценарий:     %s\n", result.Scenario)
 	fmt.Printf("длительность: %s\n\n", result.Duration)
 
-	fmt.Println("--- Отправлено (client → server) ---")
-	fmt.Printf("пакетов: %d\n", result.Sent.PacketsSent)
-	fmt.Printf("байт:    %d\n", result.Sent.BytesSent)
-	fmt.Printf("ошибок:  %d\n\n", result.Sent.Errors)
+	fmt.Println("--- Отправлено ---")
+	fmt.Printf("пакетов: %d  байт: %d  ошибок: %d\n\n",
+		result.Sent.PacketsSent,
+		result.Sent.BytesSent,
+		result.Sent.Errors,
+	)
 
-	fmt.Println("--- Получено сервером (метрики сервера) ---")
-	s := result.Received
-	fmt.Printf("пакетов:    %d\n", s.PacketsReceived)
-	fmt.Printf("throughput: %.2f KB/s\n", s.ThroughputBps/1024)
+	// RTT — основная метрика
+	c := result.ClientMetrics.BenchmarkTraffic
+	fmt.Println("--- RTT (round-trip time, ms) ---")
+	fmt.Printf("получено echo: %d пакетов\n", c.PacketsReceived)
+	fmt.Printf("avg: %.2f  p50: %.2f  p95: %.2f  p99: %.2f  max: %.2f\n\n",
+		c.Latency.Avg,
+		c.Latency.P50,
+		c.Latency.P95,
+		c.Latency.P99,
+		c.Latency.Max,
+	)
 
-	if s.BenchmarkTraffic.PacketsReceived > 0 {
-		fmt.Println("\n  Latency (ms):")
-		fmt.Printf("  avg: %.2f  p50: %.2f  p95: %.2f  p99: %.2f  max: %.2f\n",
-			s.BenchmarkTraffic.Latency.Avg,
-			s.BenchmarkTraffic.Latency.P50,
-			s.BenchmarkTraffic.Latency.P95,
-			s.BenchmarkTraffic.Latency.P99,
-			s.BenchmarkTraffic.Latency.Max,
-		)
-		fmt.Println("\n  Jitter (ms):")
-		fmt.Printf("  avg: %.2f  max: %.2f\n",
-			s.BenchmarkTraffic.Jitter.Avg,
-			s.BenchmarkTraffic.Jitter.Max,
-		)
-	}
+	fmt.Println("--- Jitter (ms) ---")
+	fmt.Printf("avg: %.2f  max: %.2f\n\n",
+		c.Jitter.Avg,
+		c.Jitter.Max,
+	)
 
+	// Throughput с сервера
+	s := result.ServerMetrics
+	fmt.Println("--- Throughput (сервер) ---")
+	fmt.Printf("%.2f KB/s\n\n", s.ThroughputBps/1024)
+
+	// Loss rate
 	lossRate := float64(0)
 	if result.Sent.PacketsSent > 0 {
-		received := s.BenchmarkTraffic.PacketsReceived
+		received := c.PacketsReceived
 		lost := result.Sent.PacketsSent - received
 		if lost < 0 {
 			lost = 0
 		}
 		lossRate = float64(lost) / float64(result.Sent.PacketsSent) * 100
 	}
-	fmt.Printf("\nпотери: %.2f%%\n", lossRate)
+	fmt.Printf("потери echo: %.2f%%\n", lossRate)
 	fmt.Printf("\nРезультат сохранён: %s\n", outPath)
 }

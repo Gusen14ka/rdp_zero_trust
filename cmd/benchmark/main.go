@@ -31,7 +31,6 @@ func main() {
 	serverAddr := flag.String("server", "192.168.0.21:9000", "адрес control plane")
 	dataAddr := flag.String("data", "192.168.0.21:9001", "адрес data plane TCP")
 	quicAddr := flag.String("quic", "192.168.0.21:9002", "адрес data plane QUIC")
-	//adminAddr := flag.String("admin", "192.168.0.21:9999", "адрес admin HTTP")
 	caPath := flag.String("ca", "certs/ca.crt", "CA сертификат")
 	certPath := flag.String("cert", "certs/client_cert.crt", "клиентский сертификат")
 	keyPath := flag.String("key", "certs/client_key.key", "приватный ключ")

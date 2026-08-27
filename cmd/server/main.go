@@ -392,8 +392,10 @@ func listenQuicData(addr, certPath, keyPath string) {
 func handleTcpData(conn net.Conn) {
 	defer conn.Close()
 
+	protoConn := proto.NewConn(conn)
+
 	// Подготавливаем соединение
-	sess, err := prepareDataConn(conn, "tcp")
+	sess, err := prepareDataConn(protoConn, "tcp")
 	if err != nil {
 		log.Printf("err in preparing DataConn: %v", err)
 		return
@@ -403,7 +405,7 @@ func handleTcpData(conn net.Conn) {
 
 	switch sess.Mode {
 	case session.Mstsc:
-		target, err := connectToTarget(conn, sess, "tcp")
+		target, err := connectToTarget(protoConn, sess, "tcp")
 		if err != nil {
 			log.Printf("error in connecting to target: %v", err)
 			return
@@ -434,8 +436,10 @@ func handleQuicData(qconn *quic.Conn) {
 	// чтобы дальше использовать ту же логику, что и для TCP
 	conn := quicconn.New(qconn, stream)
 
+	protoConn := proto.NewConn(conn)
+
 	// Передаём в общий обработчик
-	sess, err := prepareDataConn(conn, "quic")
+	sess, err := prepareDataConn(protoConn, "quic")
 	if err != nil {
 		log.Printf("error in preparing DataConn: %v", err)
 		return
@@ -445,7 +449,7 @@ func handleQuicData(qconn *quic.Conn) {
 
 	switch sess.Mode {
 	case session.Mstsc:
-		target, err := connectToTarget(conn, sess, "quic")
+		target, err := connectToTarget(protoConn, sess, "quic")
 		if err != nil {
 			log.Printf("error in connecting to target: %v", err)
 			return
@@ -454,7 +458,12 @@ func handleQuicData(qconn *quic.Conn) {
 		handleDataDefault(conn, target, sess, "quic")
 
 	case session.Freerdp:
-		handleDataFreerdp(qconn, sess)
+		// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
+		if err := protoConn.Send(proto.MsgOK); err != nil {
+			sessionMetrics.Delete(sess.ID)
+			return
+		}
+		handleDataFreerdp(qconn)
 	}
 }
 
@@ -463,19 +472,16 @@ func handleQuicData(qconn *quic.Conn) {
 Получаем сессию от клиента TODO: проверить нельзя ли на этом этапе клиенту дать нам любой id сессии
 Возвращаем объект сессии (там классификация соединения)
 */
-func prepareDataConn(conn net.Conn, protoName string) (*session.Session, error) {
-	defer conn.Close()
+func prepareDataConn(conn *proto.Conn, protoName string) (*session.Session, error) {
 
 	// Убираем задержки и Нейгла
-	pipe.TuneConn(conn)
-	// Оборачиваем соединение в наш протокол (чтение/запись сообщений)
-	c := proto.NewConn(conn)
+	pipe.TuneConn(conn.RawConn())
 
 	// Ожидаем первое сообщение от клиента: SESSION <id>
-	msgType, args, err := c.Recv()
+	msgType, args, err := conn.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
 		log.Printf("%s: ожидал SESSION, получил: %v %v err=%v", protoName, msgType, args, err)
-		c.Send(proto.MsgError, "invalid session request")
+		conn.Send(proto.MsgError, "invalid session request")
 		return nil, fmt.Errorf("invalid session request")
 	}
 	sessionId := args[0]
@@ -484,7 +490,7 @@ func prepareDataConn(conn net.Conn, protoName string) (*session.Session, error) 
 	sess, ok := sessions.Get(sessionId)
 	if !ok {
 		log.Printf("%s: неизвестная сессия %s", protoName, sessionId)
-		c.Send(proto.MsgError, "session not found")
+		conn.Send(proto.MsgError, "session not found")
 		return nil, fmt.Errorf("session not found")
 	}
 
@@ -513,15 +519,13 @@ func prepareDataConn(conn net.Conn, protoName string) (*session.Session, error) 
 Соединяемся с таргет-машиной
 Создаём коллектор метрик
 */
-func connectToTarget(conn net.Conn, sess *session.Session, protoName string) (net.Conn, error) {
-	// Оборачиваем соединение в наш протокол (чтение/запись сообщений)
-	c := proto.NewConn(conn)
+func connectToTarget(conn *proto.Conn, sess *session.Session, protoName string) (net.Conn, error) {
 
 	// Подключаемся к целевой машине (RDP сервер или любой TCP target)
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
 		log.Printf("%s: не могу подключиться к %s: %v", protoName, sess.TargetAddr, err)
-		c.Send(proto.MsgError, "target connection failed")
+		conn.Send(proto.MsgError, "target connection failed")
 		return nil, fmt.Errorf("target connection failed: %v", err)
 	}
 
@@ -537,7 +541,7 @@ func connectToTarget(conn net.Conn, sess *session.Session, protoName string) (ne
 	//defer sessionMetrics.Delete(sessionId)
 
 	// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
-	if err := c.Send(proto.MsgOK); err != nil {
+	if err := conn.Send(proto.MsgOK); err != nil {
 		target.Close()
 		sessionMetrics.Delete(sess.ID)
 		return nil, err
@@ -566,7 +570,21 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 }
 
 // Мультиплексированное проксирвоание N quic стримами
-func handleDataFreerdp(qconn *quic.Conn, sess *session.Session) {
+func handleDataFreerdp(qconn *quic.Conn) {
+	// Принимаем стримы от клиента — клиент их открывает
+	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
+	for i := 0; i < bridge.ChannelCount; i++ {
+		stream, err := qconn.AcceptStream(context.Background())
+		if err != nil {
+			log.Printf("accept stream %s: %v", bridge.ChannelNames[i], err)
+			return
+		}
+		quicStreams[i] = stream
+		log.Printf("стрим %s принят (id=%d)",
+			bridge.ChannelNames[i], stream.StreamID())
+	}
+
+	// Принимаем Unix соединения от freerdp-quic-proxy
 	unixConns, err := bridge.ListenAll()
 	if err != nil {
 		log.Printf("bridge listen: %v", err)
@@ -577,18 +595,6 @@ func handleDataFreerdp(qconn *quic.Conn, sess *session.Session) {
 			c.Close()
 		}
 	}()
-
-	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
-
-	for i := 0; i < bridge.ChannelCount; i++ {
-		stream, err := qconn.OpenStreamSync(context.Background())
-		if err != nil {
-			log.Fatalf("open stream %s: %v", bridge.ChannelNames[i], err)
-		}
-		quicStreams[i] = stream
-		log.Printf("стрим %s открыт (id=%d)",
-			bridge.ChannelNames[i], stream.StreamID())
-	}
 
 	bridge.BridgeChannels(unixConns, quicStreams)
 	log.Printf("handleDataFreerdp завершён")

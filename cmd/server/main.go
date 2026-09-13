@@ -460,10 +460,9 @@ func handleQuicData(qconn *quic.Conn) {
 	case session.Freerdp:
 		// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
 		if err := protoConn.Send(proto.MsgOK); err != nil {
-			sessionMetrics.Delete(sess.ID)
 			return
 		}
-		handleDataFreerdp(qconn)
+		handleDataFreerdp(qconn, protoConn, sess)
 	}
 }
 
@@ -569,35 +568,88 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 	log.Printf("%s: [%s] завершено err1=%v err2=%v", protoName, sess.ID[:8], err1, err2)
 }
 
-// Мультиплексированное проксирвоание N quic стримами
-func handleDataFreerdp(qconn *quic.Conn) {
-	// Принимаем стримы от клиента — клиент их открывает
-	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
-	for i := 0; i < bridge.ChannelCount; i++ {
-		stream, err := qconn.AcceptStream(context.Background())
-		if err != nil {
-			log.Printf("accept stream %s: %v", bridge.ChannelNames[i], err)
-			return
-		}
-		quicStreams[i] = stream
-		log.Printf("стрим %s принят (id=%d)",
-			bridge.ChannelNames[i], stream.StreamID())
+// handleDataFreerdp — фаза 1: сырой relay негоциации между xfreerdp-quic (через
+// клиента) и pf_server; фаза 2 (после SWITCH_CHANNELS): 4 QUIC-стрима напрямую
+// в unix-сокеты, которые уже льёт наш C-модуль quicmux внутри pf_server.
+func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session) {
+	// Отдельный стрим только для сырых байт негоциации — ctrl остаётся
+	// чисто текстовым протоколом (SESSION/OK, дальше SWITCH_CHANNELS/OK)
+	relayStream, err := qconn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("freerdp: accept relay stream: %v", err)
+		return
 	}
 
-	// Принимаем Unix соединения от freerdp-quic-proxy
+	// ВАЖНО: sess.TargetAddr для freerdp-режима должен указывать на локальный
+	// listener pf_server (например 127.0.0.1:3390 на таргет-машине), а НЕ на
+	// реальный RDP-сервер напрямую — с реальным таргетом соединяется pf_client
+	// внутри самого freerdp-proxy, это уже вне зоны ответственности Go
+	target, err := net.Dial("tcp", sess.TargetAddr)
+	if err != nil {
+		log.Printf("freerdp: не могу подключиться к pf_server %s: %v", sess.TargetAddr, err)
+		return
+	}
+	pipe.TuneConn(target)
+
+	relayDone := make(chan struct{})
+	relayStreamPConn := quicconn.New(qconn, relayStream)
+	go func() {
+		defer close(relayDone)
+		err1, err2 := pipe.Pipe(relayStreamPConn, target)
+		log.Printf("freerdp: [%s] фаза 1 relay завершена err1=%v err2=%v", sess.ID[:8], err1, err2)
+	}()
+
+	// Ждём сигнал от клиента: xfreerdp-quic дошёл до PostConnect и подключился
+	// ко всем 4 unix-каналам на своей стороне
+	msgType, _, err := ctrl.Recv()
+	if err != nil || msgType != proto.MsgSwitchChannels {
+		log.Printf("freerdp: не дождались SWITCH_CHANNELS: %v %v", msgType, err)
+		relayStream.Close()
+		target.Close()
+		<-relayDone
+		return
+	}
+
+	relayStream.Close()
+	<-relayDone
+	log.Printf("freerdp: [%s] фаза 1 завершена, переключаюсь", sess.ID[:8])
+
+	if err := ctrl.Send(proto.MsgOK); err != nil {
+		log.Printf("freerdp: не удалось подтвердить переключение: %v", err)
+		target.Close()
+		return
+	}
+
+	// target НЕ закрываем — это то самое персистентное TCP-соединение к
+	// pf_server, на котором прошла негоциация; quicmux внутри pf_server сам
+	// продолжает жить на этом же соединении, просто дальше уже физически
+	// ничего по нему не гоняется (данные теперь идут через unix-сокеты)
 	unixConns, err := bridge.ListenAll()
 	if err != nil {
-		log.Printf("bridge listen: %v", err)
+		log.Printf("freerdp: bridge listen: %v", err)
+		target.Close()
 		return
 	}
 	defer func() {
 		for _, c := range unixConns {
 			c.Close()
 		}
+		target.Close()
 	}()
 
+	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
+	for i := 0; i < bridge.ChannelCount; i++ {
+		stream, err := qconn.AcceptStream(context.Background())
+		if err != nil {
+			log.Printf("freerdp: accept stream %s: %v", bridge.ChannelNames[i], err)
+			return
+		}
+		quicStreams[i] = stream
+		log.Printf("стрим %s принят (id=%d)", bridge.ChannelNames[i], stream.StreamID())
+	}
+
 	bridge.BridgeChannels(unixConns, quicStreams)
-	log.Printf("handleDataFreerdp завершён")
+	log.Printf("handleDataFreerdp: [%s] завершён", sess.ID[:8])
 }
 
 // handleBenchmarkData - обработка бенчмарка (только client-server)

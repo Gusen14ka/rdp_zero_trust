@@ -47,26 +47,14 @@ func main() {
 	case "mstsc":
 		runMstscMode(*localAddr, *dataAddr, *transport, sessionId, *caPath)
 	case "freerdp":
-		runFreerdpMode(*dataAddr, sessionId, *caPath)
+		runFreerdpMode(*localAddr, *dataAddr, sessionId, *caPath)
 	}
 
 }
 
 // Реализация пайплайна с подключением в freerdp
-func runFreerdpMode(dataAddr, sessionID, caPath string) {
+func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	log.Printf("режим freerdp: ждём подключения xfreerdp-quic...")
-
-	// Шаг 1: принимаем Unix сокеты от xfreerdp-quic
-	unixConns, err := bridge.ListenAll()
-	if err != nil {
-		log.Fatalf("bridge listen: %v", err)
-	}
-	defer func() {
-		for _, c := range unixConns {
-			c.Close()
-		}
-	}()
-	log.Printf("все каналы подключены, устанавливаем QUIC...")
 
 	// TODO: 2 и 3 шаги вынести в отдельную функцию и объединить с tunnelQUIC
 	// Шаг 2: устанавливаем QUIC соединение с сервером
@@ -101,6 +89,55 @@ func runFreerdpMode(dataAddr, sessionID, caPath string) {
 		log.Fatalf("handshake failed: %v", err)
 	}
 	log.Printf("сессия подтверждена, открываем каналы...")
+
+	// Фаза 1: отдельный стрим — сырой relay между локальным xfreerdp-quic и pf_server
+	relayStream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		log.Fatalf("open relay stream: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", localAddr)
+	if err != nil {
+		log.Fatalf("local listen: %v", err)
+	}
+	log.Printf("слушаю %s — сюда должен стучаться xfreerdp-quic (/v:%s)", localAddr, localAddr)
+
+	local, err := ln.Accept()
+	ln.Close()
+	if err != nil {
+		log.Fatalf("accept from xfreerdp-quic: %v", err)
+	}
+
+	relayDone := make(chan struct{})
+	relayStreamPConn := quicconn.New(conn, relayStream)
+	go func() {
+		defer close(relayDone)
+		err1, err2 := pipe.Pipe(relayStreamPConn, local)
+		log.Printf("фаза 1 relay завершена: err1=%v err2=%v", err1, err2)
+	}()
+
+	// Шаг 1: принимаем Unix сокеты от xfreerdp-quic
+	unixConns, err := bridge.ListenAll()
+	if err != nil {
+		log.Fatalf("bridge listen: %v", err)
+	}
+	defer func() {
+		for _, c := range unixConns {
+			c.Close()
+		}
+	}()
+	log.Printf("все Unix сокеты слушаются...")
+
+	log.Printf("все 4 unix-канала подключены, останавливаю фазу 1")
+	local.Close()
+	relayStream.Close()
+	<-relayDone
+
+	c.Send(proto.MsgSwitchChannels)
+	msgType, args, err = c.Recv()
+	if err != nil || msgType != proto.MsgOK {
+		log.Fatalf("сервер не подтвердил переключение: %v %v %v", msgType, args, err)
+	}
 
 	// Шаг 4: открываем отдельный QUIC стрим для каждого канала
 	quicStreams := make([]*quic.Stream, bridge.ChannelCount)

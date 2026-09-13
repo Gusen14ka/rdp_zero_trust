@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"rdp_zero_trust/internal/admin"
+	"rdp_zero_trust/internal/agentpool"
 	"rdp_zero_trust/internal/benchproto"
 	"rdp_zero_trust/internal/bridge"
 	"rdp_zero_trust/internal/config"
@@ -52,6 +54,7 @@ func main() {
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
 	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
 	netIface := flag.String("iface", "enp0s3", "сетевой интерфейс для tc netem")
+	agentAddr := flag.String("agent", ":9004", "адрес agent plane (QUIC)")
 	flag.Parse()
 
 	sessionTtl = *ttl
@@ -85,6 +88,9 @@ func main() {
 	// Запускаем admin HTTP сервер
 	adminSrv := admin.NewServer(sessions, &sessionMetrics)
 	go adminSrv.Start(*adminAddr)
+
+	// Запускаем сервер для агентов
+	go listenAgentData(*agentAddr, *certPath, *keyPath, *caCertPath)
 
 	// Запускаем оба листенера параллельно
 	go listenControl(*controlAddr, *certPath, *keyPath, *caCertPath)
@@ -620,36 +626,57 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 		return
 	}
 
-	// target НЕ закрываем — это то самое персистентное TCP-соединение к
-	// pf_server, на котором прошла негоциация; quicmux внутри pf_server сам
-	// продолжает жить на этом же соединении, просто дальше уже физически
-	// ничего по нему не гоняется (данные теперь идут через unix-сокеты)
-	unixConns, err := bridge.ListenAll()
-	if err != nil {
-		log.Printf("freerdp: bridge listen: %v", err)
-		target.Close()
+	// Находим агента для машины этой сессии
+	agent, ok := agentpool.Get(sess.MachineID)
+	if !ok {
+		log.Printf("freerdp: [%s] нет подключённого агента для %s", sess.ID[:8], sess.MachineID)
+		ctrl.Send(proto.MsgError, "agent not connected")
 		return
 	}
-	defer func() {
-		for _, c := range unixConns {
-			c.Close()
-		}
-		target.Close()
-	}()
 
-	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
+	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
+	if err != nil {
+		log.Printf("freerdp: [%s] не удалось получить мост от агента: %v", sess.ID[:8], err)
+		ctrl.Send(proto.MsgError, "agent bridge failed")
+		return
+	}
+
+	if err := ctrl.Send(proto.MsgOK); err != nil {
+		log.Printf("freerdp: не удалось подтвердить переключение клиенту: %v", err)
+		return
+	}
+
+	clientStreams := make([]*quic.Stream, bridge.ChannelCount)
 	for i := 0; i < bridge.ChannelCount; i++ {
 		stream, err := qconn.AcceptStream(context.Background())
 		if err != nil {
 			log.Printf("freerdp: accept stream %s: %v", bridge.ChannelNames[i], err)
 			return
 		}
-		quicStreams[i] = stream
-		log.Printf("стрим %s принят (id=%d)", bridge.ChannelNames[i], stream.StreamID())
+		clientStreams[i] = stream
 	}
 
-	bridge.BridgeChannels(unixConns, quicStreams)
+	var wg sync.WaitGroup
+	for i := 0; i < bridge.ChannelCount; i++ {
+		wg.Add(1)
+		go func(a, b *quic.Stream) {
+			defer wg.Done()
+			bridgeQuicStreams(a, b)
+		}(clientStreams[i], agentStreams[i])
+	}
+	wg.Wait()
+
 	log.Printf("handleDataFreerdp: [%s] завершён", sess.ID[:8])
+}
+
+// bridgeQuicStreams гоняет байты между двумя QUIC-стримами в обе стороны —
+// клиентским (к xfreerdp-quic) и агентским (к quicmux на таргет-машине).
+func bridgeQuicStreams(a, b *quic.Stream) {
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, b); a.Close(); done <- struct{}{} }()
+	go func() { io.Copy(b, a); b.Close(); done <- struct{}{} }()
+	<-done
+	<-done
 }
 
 // handleBenchmarkData - обработка бенчмарка (только client-server)
@@ -697,4 +724,74 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 			raw.SetWriteDeadline(time.Time{})
 		}
 	}
+}
+
+func listenAgentData(addr, certPath, keyPath, caCertPath string) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("agent tls cert: %v", err)
+	}
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		log.Fatalf("agent read ca: %v", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("agent parse ca cert")
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caPool,
+		NextProtos:   []string{"rdp-zero-trust-agent"},
+	}
+
+	ln, err := quic.ListenAddr(addr, tlsCfg, &quic.Config{
+		MaxIdleTimeout:  5 * time.Minute,
+		KeepAlivePeriod: 10 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("agent listen: %v", err)
+	}
+	log.Printf("agent plane (QUIC mTLS) слушает %s", addr)
+
+	for {
+		qconn, err := ln.Accept(context.Background())
+		if err != nil {
+			log.Printf("agent accept: %v", err)
+			continue
+		}
+		go handleAgentConn(qconn)
+	}
+}
+
+func handleAgentConn(qconn *quic.Conn) {
+	ctrlStream, err := qconn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("agent: accept ctrl stream: %v", err)
+		qconn.CloseWithError(0, "no ctrl stream")
+		return
+	}
+	ctrl := proto.NewConn(quicconn.New(qconn, ctrlStream))
+
+	msgType, args, err := ctrl.Recv()
+	if err != nil || msgType != proto.MsgRegister || len(args) == 0 {
+		ctrl.Send(proto.MsgError, "expected REGISTER <machine_id>")
+		return
+	}
+	machineID := args[0]
+
+	// TODO: сверить machineID с CN из клиентского сертификата агента —
+	// сейчас доверяем значению из REGISTER как есть, это временное упрощение
+	if err := ctrl.Send(proto.MsgOK); err != nil {
+		return
+	}
+
+	agent := agentpool.Register(machineID, qconn, ctrl)
+	log.Printf("agent: зарегистрирован %s", machineID)
+
+	<-qconn.Context().Done()
+	agentpool.Unregister(machineID, agent)
+	log.Printf("agent: отключился %s", machineID)
 }

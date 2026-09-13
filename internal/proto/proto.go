@@ -17,6 +17,8 @@ const (
 	MsgOK             = "OK"
 	MsgError          = "ERROR"
 	MsgSwitchChannels = "SWITCH_CHANNELS"
+	MsgRegister       = "REGISTER"
+	MsgOpenBridge     = "OPEN_BRIDGE"
 )
 
 // Таймауты

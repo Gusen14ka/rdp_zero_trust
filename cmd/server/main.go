@@ -578,61 +578,44 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 // клиента) и pf_server; фаза 2 (после SWITCH_CHANNELS): 4 QUIC-стрима напрямую
 // в unix-сокеты, которые уже льёт наш C-модуль quicmux внутри pf_server.
 func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session) {
-	// Отдельный стрим только для сырых байт негоциации — ctrl остаётся
-	// чисто текстовым протоколом (SESSION/OK, дальше SWITCH_CHANNELS/OK)
-	relayStream, err := qconn.AcceptStream(context.Background())
-	if err != nil {
-		log.Printf("freerdp: accept relay stream: %v", err)
-		return
-	}
-
-	// ВАЖНО: sess.TargetAddr для freerdp-режима должен указывать на локальный
-	// listener pf_server (например 127.0.0.1:3390 на таргет-машине), а НЕ на
-	// реальный RDP-сервер напрямую — с реальным таргетом соединяется pf_client
-	// внутри самого freerdp-proxy, это уже вне зоны ответственности Go
-	target, err := net.Dial("tcp", sess.TargetAddr)
-	if err != nil {
-		log.Printf("freerdp: не могу подключиться к pf_server %s: %v", sess.TargetAddr, err)
-		return
-	}
-	pipe.TuneConn(target)
-
-	relayDone := make(chan struct{})
-	relayStreamPConn := quicconn.New(qconn, relayStream)
-	go func() {
-		defer close(relayDone)
-		err1, err2 := pipe.Pipe(relayStreamPConn, target)
-		log.Printf("freerdp: [%s] фаза 1 relay завершена err1=%v err2=%v", sess.ID[:8], err1, err2)
-	}()
-
-	// Ждём сигнал от клиента: xfreerdp-quic дошёл до PostConnect и подключился
-	// ко всем 4 unix-каналам на своей стороне
-	msgType, _, err := ctrl.Recv()
-	if err != nil || msgType != proto.MsgSwitchChannels {
-		log.Printf("freerdp: не дождались SWITCH_CHANNELS: %v %v", msgType, err)
-		relayStream.Close()
-		target.Close()
-		<-relayDone
-		return
-	}
-
-	relayStream.Close()
-	<-relayDone
-	log.Printf("freerdp: [%s] фаза 1 завершена, переключаюсь", sess.ID[:8])
-
-	if err := ctrl.Send(proto.MsgOK); err != nil {
-		log.Printf("freerdp: не удалось подтвердить переключение: %v", err)
-		target.Close()
-		return
-	}
-
-	// Находим агента для машины этой сессии
 	agent, ok := agentpool.Get(sess.MachineID)
 	if !ok {
 		log.Printf("freerdp: [%s] нет подключённого агента для %s", sess.ID[:8], sess.MachineID)
 		ctrl.Send(proto.MsgError, "agent not connected")
 		return
 	}
+
+	relayStream, err := qconn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("freerdp: accept relay stream: %v", err)
+		return
+	}
+
+	agentRelayStream, err := agent.RequestRelay(sess.ID, 10*time.Second)
+	if err != nil {
+		log.Printf("freerdp: [%s] не удалось получить relay от агента: %v", sess.ID[:8], err)
+		relayStream.Close()
+		return
+	}
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		bridgeQuicStreams(relayStream, agentRelayStream)
+		log.Printf("freerdp: [%s] фаза 1 relay завершена", sess.ID[:8])
+	}()
+
+	msgType, _, err := ctrl.Recv() // ждём SWITCH_CHANNELS
+	if err != nil || msgType != proto.MsgSwitchChannels {
+		log.Printf("freerdp: не дождались SWITCH_CHANNELS: %v %v", msgType, err)
+		relayStream.Close()
+		agentRelayStream.Close()
+		<-relayDone
+		return
+	}
+	relayStream.Close()
+	agentRelayStream.Close()
+	<-relayDone
 
 	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
 	if err != nil {

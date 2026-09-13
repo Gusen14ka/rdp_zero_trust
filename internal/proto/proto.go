@@ -18,6 +18,7 @@ const (
 	MsgError          = "ERROR"
 	MsgSwitchChannels = "SWITCH_CHANNELS"
 	MsgRegister       = "REGISTER"
+	MsgOpenRelay      = "OPEN_RELAY"
 	MsgOpenBridge     = "OPEN_BRIDGE"
 )
 

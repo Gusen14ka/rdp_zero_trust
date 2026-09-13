@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	serverAddr := flag.String("server", "192.168.0.21:9003", "адрес enrollment endpoint")
+	serverAddr := flag.String("server", "192.168.56.102:9003", "адрес enrollment endpoint")
 	username := flag.String("user", "user1", "имя пользователя")
 	password := flag.String("pass", "secret", "пароль")
 	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")

@@ -88,9 +88,26 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		}
 		log.Fatalf("handshake failed: %v", err)
 	}
-	log.Printf("сессия подтверждена, открываем каналы...")
+	log.Printf("сессия подтвержден")
 
-	// Фаза 1: отдельный стрим — сырой relay между локальным xfreerdp-quic и pf_server
+	// ВАЖНО: xfreerdp-quic подключается к unix-сокетам в СВОЁМ PreConnect —
+	// то есть ДО того как вообще попытается дозвониться по TCP на /v:.
+	// Поэтому bridge.ListenAll() должен идти раньше локального TCP listener'а,
+	// а не после него.
+	unixConns, err := bridge.ListenAll()
+	if err != nil {
+		log.Fatalf("bridge listen: %v", err)
+	}
+	defer func() {
+		for _, uc := range unixConns {
+			uc.Close()
+		}
+	}()
+	log.Printf("все 4 unix-канала подключены (xfreerdp-quic прошёл PreConnect)")
+
+	// Фаза 1: относительно теперь начинается по-настоящему — открываем
+	// локальный TCP listener, на который xfreerdp-quic будет дозваниваться
+	// как на свой /v:-адрес (это следующий шаг FreeRDP после PreConnect).
 	relayStream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
 		log.Fatalf("open relay stream: %v", err)
@@ -116,19 +133,20 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		log.Printf("фаза 1 relay завершена: err1=%v err2=%v", err1, err2)
 	}()
 
-	// Шаг 1: принимаем Unix сокеты от xfreerdp-quic
-	unixConns, err := bridge.ListenAll()
+	// Настоящий сигнал переключения — не факт подключения unix-сокетов
+	// (это уже случилось раньше), а маркер READY, который PostConnect
+	// у xfreerdp-quic шлёт через control-канал, когда хуки транспорта
+	// реально встали.
+	log.Printf("жду READY маркер от xfreerdp-quic (PostConnect)...")
+	marker, err := bridge.ReadPDU(unixConns[bridge.ChannelControl])
 	if err != nil {
-		log.Fatalf("bridge listen: %v", err)
+		log.Fatalf("не дождались READY маркера: %v", err)
 	}
-	defer func() {
-		for _, c := range unixConns {
-			c.Close()
-		}
-	}()
-	log.Printf("все Unix сокеты слушаются...")
+	if string(marker) != "QUICMUX_READY" {
+		log.Fatalf("неожиданный маркер вместо READY: %q", marker)
+	}
+	log.Printf("получен READY, останавливаю фазу 1")
 
-	log.Printf("все 4 unix-канала подключены, останавливаю фазу 1")
 	local.Close()
 	relayStream.Close()
 	<-relayDone

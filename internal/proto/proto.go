@@ -20,6 +20,7 @@ const (
 	MsgRegister       = "REGISTER"
 	MsgOpenRelay      = "OPEN_RELAY"
 	MsgOpenBridge     = "OPEN_BRIDGE"
+	MsgRelayReady     = "RELAY_READY"
 )
 
 // Таймауты

@@ -585,16 +585,24 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 		return
 	}
 
-	relayStream, err := qconn.AcceptStream(context.Background())
-	if err != nil {
-		log.Printf("freerdp: accept relay stream: %v", err)
-		return
-	}
-
+	// Поднимаем relay до pf_server ЗАРАНЕЕ — до того как клиент вообще
+	// откроет локальный порт для xfreerdp-quic
 	agentRelayStream, err := agent.RequestRelay(sess.ID, 10*time.Second)
 	if err != nil {
 		log.Printf("freerdp: [%s] не удалось получить relay от агента: %v", sess.ID[:8], err)
-		relayStream.Close()
+		ctrl.Send(proto.MsgError, "agent relay failed")
+		return
+	}
+
+	if err := ctrl.Send(proto.MsgRelayReady); err != nil {
+		log.Printf("freerdp: не удалось отправить RELAY_READY: %v", err)
+		agentRelayStream.Close()
+		return
+	}
+
+	relayStream, err := qconn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("freerdp: accept relay stream: %v", err)
 		return
 	}
 

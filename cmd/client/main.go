@@ -105,7 +105,19 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	}()
 	log.Printf("все 4 unix-канала подключены (xfreerdp-quic прошёл PreConnect)")
 
-	// Фаза 1: относительно теперь начинается по-настоящему — открываем
+	// Ждём, пока сервер прогреет relay до pf_server — только после этого
+	// открываем локальный порт, чтобы xfreerdp-quic коннектился уже в
+	// готовую трубу, без гонки по первому чтению
+	msgType, args, err = c.Recv()
+	if err != nil || msgType != proto.MsgRelayReady {
+		if len(args) > 0 {
+			log.Fatalf("сервер отклонил relay: %s", args[0])
+		}
+		log.Fatalf("не дождались RELAY_READY: %v", err)
+	}
+	log.Printf("relay-плечо на сервере готово")
+
+	// Фаза 1: теперь начинается по-настоящему — открываем
 	// локальный TCP listener, на который xfreerdp-quic будет дозваниваться
 	// как на свой /v:-адрес (это следующий шаг FreeRDP после PreConnect).
 	relayStream, err := conn.OpenStreamSync(context.Background())

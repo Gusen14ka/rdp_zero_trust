@@ -160,8 +160,8 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	log.Printf("получен READY, останавливаю фазу 1")
 
 	local.Close()
-	relayStream.Close()
-	<-relayDone
+	// relayStream.Close()
+	// <-relayDone
 
 	c.Send(proto.MsgSwitchChannels)
 	msgType, args, err = c.Recv()

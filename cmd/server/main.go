@@ -621,9 +621,10 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 		<-relayDone
 		return
 	}
-	relayStream.Close()
-	agentRelayStream.Close()
-	<-relayDone
+
+	// relayStream.Close()
+	// agentRelayStream.Close()
+	// <-relayDone
 
 	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
 	if err != nil {

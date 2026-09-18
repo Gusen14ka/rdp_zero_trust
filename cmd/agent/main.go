@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -14,6 +15,11 @@ import (
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
+)
+
+var (
+	sessionsMu   sync.Mutex
+	sessionConns = map[string]chan []net.Conn{}
 )
 
 func main() {
@@ -93,8 +99,31 @@ func run(serverAddr, machineID, pfServerAddr, caPath, certPath, keyPath string) 
 // машина) и открывает ОДИН QUIC-стрим до сервера, помеченный этой сессией
 // и purpose="relay", дальше просто гоняет байты в обе стороны.
 func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
-	log.Printf("agent: [%s] фаза 1 — дозваниваюсь до pf_server %s", sessionID[:8], pfServerAddr)
+	// Сокеты должны существовать ДО того как pf_server примет соединение:
+	// quicmux коннектится к ним в ServerSessionStarted, то есть сразу,
+	// иначе хук падает и pf_server рвёт сессию.
+	listeners, err := bridge.BindAll()
+	if err != nil {
+		log.Printf("agent: [%s] bind unix: %v", sessionID[:8], err)
+		return
+	}
 
+	connsCh := make(chan []net.Conn, 1)
+	sessionsMu.Lock()
+	sessionConns[sessionID] = connsCh
+	sessionsMu.Unlock()
+
+	go func() {
+		conns, err := bridge.AcceptAll(listeners)
+		if err != nil {
+			log.Printf("agent: [%s] accept unix: %v", sessionID[:8], err)
+			return
+		}
+		log.Printf("agent: [%s] quicmux подключился ко всем каналам", sessionID[:8])
+		connsCh <- conns
+	}()
+
+	log.Printf("agent: [%s] фаза 1 — дозваниваюсь до pf_server %s", sessionID[:8], pfServerAddr)
 	target, err := net.Dial("tcp", pfServerAddr)
 	if err != nil {
 		log.Printf("agent: [%s] не могу подключиться к pf_server: %v", sessionID[:8], err)
@@ -115,8 +144,7 @@ func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
 		log.Printf("agent: [%s] handshake relay-стрима: %v", sessionID[:8], err)
 		return
 	}
-	msgType, _, err := pc.Recv()
-	if err != nil || msgType != proto.MsgOK {
+	if msgType, _, err := pc.Recv(); err != nil || msgType != proto.MsgOK {
 		log.Printf("agent: [%s] сервер не подтвердил relay-стрим: %v", sessionID[:8], err)
 		return
 	}
@@ -128,11 +156,21 @@ func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
 // handleBridge — фаза 2: поднимает unix-мост (сюда стучится quicmux) и
 // мультиплексирует 4 канала в 4 QUIC-стрима, каждый помечен purpose="bridge".
 func handleBridge(qconn *quic.Conn, sessionID string) {
-	log.Printf("agent: [%s] фаза 2 — поднимаю мост, жду quicmux...", sessionID[:8])
+	sessionsMu.Lock()
+	connsCh, ok := sessionConns[sessionID]
+	delete(sessionConns, sessionID)
+	sessionsMu.Unlock()
 
-	unixConns, err := bridge.ListenAll()
-	if err != nil {
-		log.Printf("agent: [%s] bridge listen: %v", sessionID[:8], err)
+	if !ok {
+		log.Printf("agent: [%s] нет подготовленных unix-каналов", sessionID[:8])
+		return
+	}
+
+	var unixConns []net.Conn
+	select {
+	case unixConns = <-connsCh:
+	case <-time.After(10 * time.Second):
+		log.Printf("agent: [%s] таймаут ожидания подключения quicmux", sessionID[:8])
 		return
 	}
 	defer func() {
@@ -140,7 +178,8 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 			c.Close()
 		}
 	}()
-	log.Printf("agent: [%s] все unix-каналы подключены (quicmux на связи)", sessionID[:8])
+
+	log.Printf("agent: [%s] фаза 2 — открываю QUIC-стримы", sessionID[:8])
 
 	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
 	for i := 0; i < bridge.ChannelCount; i++ {
@@ -152,17 +191,13 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 
 		pc := proto.NewConn(quicconn.New(qconn, stream))
 		if err := pc.Send(proto.MsgSession, sessionID, "bridge"); err != nil {
-			log.Printf("agent: [%s] handshake на стриме %s: %v",
-				sessionID[:8], bridge.ChannelNames[i], err)
+			log.Printf("agent: [%s] handshake на стриме %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
 			return
 		}
-		msgType, _, err := pc.Recv()
-		if err != nil || msgType != proto.MsgOK {
-			log.Printf("agent: [%s] сервер не подтвердил стрим %s: %v",
-				sessionID[:8], bridge.ChannelNames[i], err)
+		if msgType, _, err := pc.Recv(); err != nil || msgType != proto.MsgOK {
+			log.Printf("agent: [%s] сервер не подтвердил стрим %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
 			return
 		}
-
 		quicStreams[i] = stream
 	}
 

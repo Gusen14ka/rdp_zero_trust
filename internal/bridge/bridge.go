@@ -107,6 +107,44 @@ func ListenAll() ([]net.Conn, error) {
 	return conns, nil
 }
 
+// BindAll создаёт 4 Unix listener'а и сразу возвращается — сокеты уже
+// существуют на диске, но подключения ещё не приняты.
+func BindAll() ([]net.Listener, error) {
+	os.MkdirAll(SocketDir, 0700)
+
+	listeners := make([]net.Listener, ChannelCount)
+	for i := 0; i < ChannelCount; i++ {
+		path := SocketDir + "/" + ChannelNames[i] + ".sock"
+		os.Remove(path)
+
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				listeners[j].Close()
+			}
+			return nil, fmt.Errorf("listen %s: %w", path, err)
+		}
+		listeners[i] = ln
+		log.Printf("bridge: слушаем канал %s", ChannelNames[i])
+	}
+	return listeners, nil
+}
+
+// AcceptAll блокируется, принимая по одному подключению на каждый listener.
+func AcceptAll(listeners []net.Listener) ([]net.Conn, error) {
+	conns := make([]net.Conn, ChannelCount)
+	for i := 0; i < ChannelCount; i++ {
+		conn, err := listeners[i].Accept()
+		if err != nil {
+			return conns, fmt.Errorf("accept %s: %w", ChannelNames[i], err)
+		}
+		conns[i] = conn
+		listeners[i].Close()
+		log.Printf("bridge: канал %s подключён", ChannelNames[i])
+	}
+	return conns, nil
+}
+
 func forwardPDUs(wg *sync.WaitGroup, src io.Reader, dst io.Writer,
 	name string, direction string) {
 	defer wg.Done()

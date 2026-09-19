@@ -141,8 +141,8 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	relayStreamPConn := quicconn.New(conn, relayStream)
 	go func() {
 		defer close(relayDone)
-		err1, err2 := pipe.Pipe(relayStreamPConn, local)
-		log.Printf("фаза 1 relay завершена: err1=%v err2=%v", err1, err2)
+		relayCopyLocalOnly(relayStreamPConn, local)
+		log.Printf("фаза 1 relay (клиентская сторона) завершена")
 	}()
 
 	// Настоящий сигнал переключения — не факт подключения unix-сокетов
@@ -209,6 +209,24 @@ func runMstscMode(localAddr, dataAddr, transport, sessionId, caPath string) {
 			go tunnelQUIC(local, dataAddr, sessionId, caPath)
 		}
 	}
+}
+
+// relayCopyLocalOnly гоняет байты между quicSide и local, но, в отличие от
+// pipe.Pipe, НИКОГДА не закрывает и не half-close'ит quicSide — этот QUIC-
+// стрим должен остаться живым для pf_server даже после того как local
+// закроется (xfreerdp-quic переключился на unix-каналы).
+func relayCopyLocalOnly(quicSide io.ReadWriter, local net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(local, quicSide)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(quicSide, local)
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
 }
 
 // authenticate подключается к control plane и получает адрес целевой машины

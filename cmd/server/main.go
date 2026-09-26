@@ -609,7 +609,7 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	relayDone := make(chan struct{})
 	go func() {
 		defer close(relayDone)
-		bridgeQuicStreams(relayStream, agentRelayStream)
+		bridgeQuicStreams("Фиктивное соединение", relayStream, agentRelayStream)
 		log.Printf("freerdp: [%s] фаза 1 relay завершена", sess.ID[:8])
 	}()
 
@@ -653,7 +653,7 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 		wg.Add(1)
 		go func(a, b *quic.Stream) {
 			defer wg.Done()
-			bridgeQuicStreams(a, b)
+			bridgeQuicStreams(bridge.ChannelNames[i], a, b)
 		}(clientStreams[i], agentStreams[i])
 	}
 	wg.Wait()
@@ -663,10 +663,20 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 
 // bridgeQuicStreams гоняет байты между двумя QUIC-стримами в обе стороны —
 // клиентским (к xfreerdp-quic) и агентским (к quicmux на таргет-машине).
-func bridgeQuicStreams(a, b *quic.Stream) {
+func bridgeQuicStreams(name string, a, b *quic.Stream) {
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); a.Close(); done <- struct{}{} }()
-	go func() { io.Copy(b, a); b.Close(); done <- struct{}{} }()
+	go func() {
+		n, err := io.Copy(a, b)
+		log.Printf("[%s] agent→client: скопировано %d байт, err=%v", name, n, err)
+		a.Close()
+		done <- struct{}{}
+	}()
+	go func() {
+		n, err := io.Copy(b, a)
+		log.Printf("[%s] client→agent: скопировано %d байт, err=%v", name, n, err)
+		b.Close()
+		done <- struct{}{}
+	}()
 	<-done
 	<-done
 }

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -642,10 +643,31 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	for i := 0; i < bridge.ChannelCount; i++ {
 		stream, err := qconn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("freerdp: accept stream %s: %v", bridge.ChannelNames[i], err)
+			log.Printf("freerdp: accept client stream: %v", err)
 			return
 		}
-		clientStreams[i] = stream
+
+		pc := proto.NewConn(quicconn.New(qconn, stream))
+		msgType, args, err := pc.Recv()
+		if err != nil || msgType != proto.MsgSession || len(args) < 3 {
+			log.Printf("freerdp: некорректный хендшейк клиентского стрима: %v %v err=%v",
+				msgType, args, err)
+			return
+		}
+
+		idx, err := strconv.Atoi(args[2])
+		if err != nil || idx < 0 || idx >= bridge.ChannelCount || clientStreams[idx] != nil {
+			log.Printf("freerdp: некорректный индекс канала %q", args[2])
+			return
+		}
+
+		if err := pc.Send(proto.MsgOK); err != nil {
+			log.Printf("freerdp: не удалось подтвердить стрим: %v", err)
+			return
+		}
+
+		clientStreams[idx] = stream
+		log.Printf("freerdp: [%s] принят клиентский стрим %s", sess.ID[:8], bridge.ChannelNames[idx])
 	}
 
 	var wg sync.WaitGroup

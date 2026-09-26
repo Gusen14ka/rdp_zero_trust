@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"rdp_zero_trust/internal/bridge"
@@ -176,9 +177,21 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		if err != nil {
 			log.Fatalf("open stream %s: %v", bridge.ChannelNames[i], err)
 		}
+
+		// Обязательно пишем хендшейк СРАЗУ: пока по стриму не ушёл первый байт,
+		// сервер вообще не увидит, что стрим открыт (AcceptStream не вернётся),
+		// и весь мост встанет намертво.
+		pc := proto.NewConn(quicconn.New(conn, stream))
+		if err := pc.Send(proto.MsgSession, sessionID, "bridge", strconv.Itoa(i)); err != nil {
+			log.Fatalf("handshake стрима %s: %v", bridge.ChannelNames[i], err)
+		}
+		msgType, _, err := pc.Recv()
+		if err != nil || msgType != proto.MsgOK {
+			log.Fatalf("сервер не подтвердил стрим %s: %v", bridge.ChannelNames[i], err)
+		}
+
 		quicStreams[i] = stream
-		log.Printf("стрим %s открыт (id=%d)",
-			bridge.ChannelNames[i], stream.StreamID())
+		log.Printf("стрим %s открыт и подтверждён (id=%d)", bridge.ChannelNames[i], stream.StreamID())
 	}
 
 	// Шаг 5: для каждого канала запускаем пересылку в обе стороны

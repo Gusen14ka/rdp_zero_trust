@@ -160,7 +160,10 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	}
 	log.Printf("получен READY, останавливаю фазу 1")
 
-	local.Close()
+	//local.Close()
+	// local НЕ закрываем: EOF сделал бы TCP-сокет у xfreerdp-quic
+	// «вечно читаемым», и его цикл крутился бы вхолостую. Сокет просто
+	// молчит до конца сессии — после PostConnect в него никто не пишет.
 	// relayStream.Close()
 	// <-relayDone
 

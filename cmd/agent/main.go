@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -190,7 +191,7 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 		}
 
 		pc := proto.NewConn(quicconn.New(qconn, stream))
-		if err := pc.Send(proto.MsgSession, sessionID, "bridge"); err != nil {
+		if err := pc.Send(proto.MsgSession, sessionID, "bridge", strconv.Itoa(i)); err != nil {
 			log.Printf("agent: [%s] handshake на стриме %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
 			return
 		}

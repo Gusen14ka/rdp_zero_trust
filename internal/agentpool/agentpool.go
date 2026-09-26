@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -106,6 +107,25 @@ func (a *Agent) handleIncomingStream(s *quic.Stream) {
 		return
 	}
 	sessionID, purpose := args[0], args[1]
+
+	idx := 0
+	if purpose == PurposeBridge {
+		if len(args) < 3 {
+			log.Printf("agentpool[%s]: bridge-стрим без индекса канала", a.MachineID)
+			s.CancelRead(0)
+			s.CancelWrite(0)
+			return
+		}
+		var err error
+		idx, err = strconv.Atoi(args[2])
+		if err != nil || idx < 0 || idx >= bridge.ChannelCount {
+			log.Printf("agentpool[%s]: некорректный индекс канала %q", a.MachineID, args[2])
+			s.CancelRead(0)
+			s.CancelWrite(0)
+			return
+		}
+	}
+
 	if err := pc.Send(proto.MsgOK); err != nil {
 		return
 	}
@@ -114,19 +134,21 @@ func (a *Agent) handleIncomingStream(s *quic.Stream) {
 
 	a.mu.Lock()
 	w, ok := a.waiters[key]
-	if !ok {
-		// стрим пришёл раньше, чем RequestX успел зарегистрировать waiter —
-		// не должно происходить при нормальном порядке вызовов, но на
-		// всякий случай не теряем стрим молча
-		log.Printf("agentpool[%s]: стрим для %s без ожидающего запроса, отбрасываю",
-			a.MachineID, key)
-		a.mu.Unlock()
-		s.CancelRead(0)
-		s.CancelWrite(0)
-		return
+	if !ok { /* как было */
 	}
-	w.got = append(w.got, s)
-	full := len(w.got) == w.want
+
+	if w.got == nil {
+		w.got = make([]*quic.Stream, w.want)
+	}
+	w.got[idx] = s
+
+	full := true
+	for _, st := range w.got {
+		if st == nil {
+			full = false
+			break
+		}
+	}
 	var toSend []*quic.Stream
 	if full {
 		toSend = w.got

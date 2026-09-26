@@ -4,3 +4,4 @@
 *.exe
 certs/
 *.diff
+configs/config.json

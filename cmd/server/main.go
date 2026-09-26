@@ -5,17 +5,25 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 
 	"rdp_zero_trust/internal/admin"
+	"rdp_zero_trust/internal/agentpool"
+	"rdp_zero_trust/internal/benchproto"
+	"rdp_zero_trust/internal/bridge"
 	"rdp_zero_trust/internal/config"
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/identity"
+	"rdp_zero_trust/internal/metrics"
+	"rdp_zero_trust/internal/netem"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -25,14 +33,19 @@ import (
 var (
 	cfg        *config.Config
 	sessions   *session.Store
-	sessionTTL time.Duration
+	sessionTtl time.Duration
+
+	// sessionMetrics хранит метрики активных сессий
+	sessionMetrics sync.Map // map[sessionId]*metrics.StreamMetrics
+
+	netCtrl *netem.Controller
 )
 
 func main() {
 	controlAddr := flag.String("control", ":9000", "адрес control plane")
 	dataTCPAddr := flag.String("data", ":9001", "адрес data plane (TCP)")
 	dataQUICAddr := flag.String("quic", ":9002", "адрес data plane (QUIC)")
-	adminAddr := flag.String("admin", "127.0.0.1:9999", "адрес admin HTTP (только localhost)")
+	adminAddr := flag.String("admin", "0.0.0.0:9999", "адрес admin HTTP (только localhost)")
 	enrollAddr := flag.String("enroll", ":9003", "адрес enrollment сервера")
 	configPath := flag.String("config", "configs/config.json", "путь к конфигу")
 	caCertPath := flag.String("ca-cert", "certs/ca.crt", "сертификат CA")
@@ -40,11 +53,13 @@ func main() {
 	certPath := flag.String("cert", "certs/server.crt", "сертификат сервера")
 	keyPath := flag.String("key", "certs/server.key", "ключ сервера")
 	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
+	netIface := flag.String("iface", "enp0s3", "сетевой интерфейс для tc netem")
+	agentAddr := flag.String("agent", ":9004", "адрес agent plane (QUIC)")
 	flag.Parse()
 
-	sessionTTL = *ttl
+	sessionTtl = *ttl
 
-	// Запускаем оба листенера параллельно
+	// Загружаем конфиг
 	var err error
 	cfg, err = config.Load(*configPath)
 	if err != nil {
@@ -53,6 +68,8 @@ func main() {
 	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
 
 	sessions = session.NewStore()
+
+	netCtrl = netem.New(*netIface)
 
 	// Enrollment сервер
 	enrollSrv, err := enrollServer.NewServer(*caKeyPath, "certs/ca.crt")
@@ -69,12 +86,16 @@ func main() {
 	}()
 
 	// Запускаем admin HTTP сервер
-	adminSrv := admin.NewServer(sessions)
+	adminSrv := admin.NewServer(sessions, &sessionMetrics)
 	go adminSrv.Start(*adminAddr)
 
+	// Запускаем сервер для агентов
+	go listenAgentData(*agentAddr, *certPath, *keyPath, *caCertPath)
+
+	// Запускаем оба листенера параллельно
 	go listenControl(*controlAddr, *certPath, *keyPath, *caCertPath)
-	go listenTCPData(*dataTCPAddr, *certPath, *keyPath)
-	listenQUICData(*dataQUICAddr, *certPath, *keyPath)
+	go listenTcpData(*dataTCPAddr, *certPath, *keyPath)
+	listenQuicData(*dataQUICAddr, *certPath, *keyPath)
 }
 
 // listenControl — принимает управляющие tcp соединения на data plane
@@ -179,36 +200,52 @@ func handleControl(tlsConn *tls.Conn) {
 	log.Printf("[%s] аутентифицирован (mTLS + пароль)", username)
 	c.Send(proto.MsgOK)
 
-	// Шаг 2: CONNECT <machine_id>
+	// Шаг 2: CONNECT <machine_id> или BENCH <net params>
 	msgType, args, err = c.Recv()
-	if err != nil || msgType != proto.MsgConnect || len(args) == 0 {
+	if err != nil {
+		c.Send(proto.MsgError, "read error")
+		return
+	}
+
+	switch msgType {
+	case proto.MsgConnect:
+		handleConnectRequest(c, args, username)
+	case proto.MsgBench:
+		handleBenchRequest(c, args, username)
+	default:
+		c.Send(proto.MsgError, fmt.Sprintf("expected CONNECT or BENCH, got %s", msgType))
+	}
+}
+
+func handleConnectRequest(c *proto.Conn, args []string, username string) {
+	if len(args) == 0 {
 		c.Send(proto.MsgError, "expected CONNECT <machine_id>")
 		return
 	}
-	machineID := args[0]
+	machineId := args[0]
+	mode := args[1]
 
-	if !cfg.CanAccess(username, machineID) {
+	if !cfg.CanAccess(username, machineId) {
 		c.Send(proto.MsgError, "access denied")
-		log.Printf("[%s] нет доступа к %s", username, machineID)
+		log.Printf("[%s] нет доступа к %s", username, machineId)
 		return
 	}
 
-	targetAddr, ok := cfg.Machines[machineID]
+	targetAddr, ok := cfg.Machines[machineId]
 	if !ok {
 		c.Send(proto.MsgError, "unknown machine")
 		return
 	}
 
 	// Создаём сессию
-	sess, err := sessions.Create(username, machineID, targetAddr, sessionTTL)
+	sess, err := sessions.Create(username, machineId, targetAddr, mode, sessionTtl)
 	if err != nil {
 		c.Send(proto.MsgError, "internal error")
-		log.Printf("create session: %v", err)
 		return
 	}
 
 	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
-		username, sess.ID, machineID, sessionTTL, sess.ExpiresAt.Format("15:04:05"))
+		username, sess.ID, machineId, sessionTtl, sess.ExpiresAt.Format("15:04:05"))
 	c.Send(proto.MsgOK, sess.ID)
 
 	// Ждём одно из 3 событий:
@@ -230,11 +267,9 @@ func handleControl(tlsConn *tls.Conn) {
 	case <-ttlTimer.C:
 		log.Printf("сессия %s истекла по TTL", sess.ID)
 		c.Send(proto.MsgError, "session expired")
-
 	case <-sess.Done():
-		log.Printf("сессия %s отозвана администратором", sess.ID)
+		log.Printf("сессия %s отозвана", sess.ID)
 		c.Send(proto.MsgError, "session revoked")
-
 	case <-clientGone:
 		log.Printf("сессия %s: клиент отключился", sess.ID)
 	}
@@ -243,8 +278,87 @@ func handleControl(tlsConn *tls.Conn) {
 	log.Printf("сессия %s завершена (удалена)", sess.ID)
 }
 
+func handleBenchRequest(c *proto.Conn, args []string, username string) {
+	// Парсим сетевые параметры
+	// Формат: BENCH loss=2.00,delay=50,jitter=20,rate=0.00
+	benchParams, err := benchproto.DecodeBenchParams(args[0])
+	if err != nil {
+		c.Send(proto.MsgError, fmt.Sprintf("invalid bench params: %v", err))
+		return
+	}
+
+	// Применяем сетевые условия
+	netParams := netem.NetParams{
+		LossPct:  benchParams.LossPct,
+		DelayMs:  benchParams.DelayMs,
+		JitterMs: benchParams.JitterMs,
+		RateMbit: benchParams.RateMbit,
+	}
+
+	if err := netCtrl.Apply(netParams); err != nil {
+		c.Send(proto.MsgError, fmt.Sprintf("netem apply: %v", err))
+		return
+	}
+
+	// Создаём benchmark сессию — без привязки к машине
+	sess, err := sessions.CreateBench(username, sessionTtl, benchParams.ClientIntervalMs)
+	if err != nil {
+		c.Send(proto.MsgError, "internal error")
+		return
+	}
+
+	log.Printf("[%s] benchmark сессия %s", username, sess.ID)
+	c.Send(proto.MsgOK, sess.ID)
+
+	// Держим открытым пока клиент не отключится
+	clientGone := make(chan struct{})
+	go func() {
+		c.Recv()
+		close(clientGone)
+	}()
+
+	select {
+	case <-sess.Done():
+		c.Send(proto.MsgError, "session revoked")
+	case <-clientGone:
+		log.Printf("benchmark сессия %s завершена", sess.ID)
+	}
+
+	// Сбрасываем сетевые условия после завершения
+	netCtrl.Reset()
+
+	sessions.Delete(sess.ID)
+}
+
+// listenTCPData — принимает tcp data-соединения и проксирует на целевую машину
+func listenTcpData(addr, certPath, keyPath string) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		log.Fatalf("data tls cert: %v", err)
+	}
+	tlsCfg := tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	ln, err := tls.Listen("tcp", addr, &tlsCfg)
+	if err != nil {
+		log.Fatalf("data listen: %v", err)
+	}
+	log.Printf("data plane (TLS) слушает %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("data accept: %v", err)
+			continue
+		}
+		go handleTcpData(conn)
+	}
+}
+
 // listenQUICData — принимает QUIC соединения на data plane
-func listenQUICData(addr, certPath, keyPath string) {
+func listenQuicData(addr, certPath, keyPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		log.Fatalf("quic tls cert: %v", err)
@@ -276,130 +390,410 @@ func listenQUICData(addr, certPath, keyPath string) {
 			log.Printf("quic accept: %v", err)
 			continue
 		}
-		go handleQUIC(conn)
+		go handleQuicData(conn)
+	}
+}
+
+// handleTcpData — обработка обычного TLS/TCP соединения
+func handleTcpData(conn net.Conn) {
+	defer conn.Close()
+
+	protoConn := proto.NewConn(conn)
+
+	// Подготавливаем соединение
+	sess, err := prepareDataConn(protoConn, "tcp")
+	if err != nil {
+		log.Printf("err in preparing DataConn: %v", err)
+		return
+	}
+
+	defer sessionMetrics.Delete(sess.ID)
+
+	switch sess.Mode {
+	case session.Mstsc:
+		target, err := connectToTarget(protoConn, sess, "tcp")
+		if err != nil {
+			log.Printf("error in connecting to target: %v", err)
+			return
+		}
+		handleDataDefault(conn, target, sess, "tcp")
+
+	default:
+		log.Printf("unknown session mode: %v", sess.Mode)
+		return
 	}
 }
 
 // handleQUIC — обрабатывает одно QUIC соединение
 // Одно соединение = один стрим = одна RDP сессия
-func handleQUIC(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "done")
+func handleQuicData(qconn *quic.Conn) {
+	// Закрываем QUIC соединение при выходе
+	defer qconn.CloseWithError(0, "done")
 
-	// Принимаем стрим от клиента
-	stream, err := conn.AcceptStream(context.Background())
+	// Принимаем стрим от клиента (в QUIC данные идут через стримы)
+	stream, err := qconn.AcceptStream(context.Background())
 	if err != nil {
 		log.Printf("quic accept stream: %v", err)
 		return
 	}
 	defer stream.Close()
 
-	// Дальше всё то же самое что в handleData —
-	// стрим реализует net.Conn-подобный интерфейс
-	qconn := quicconn.New(conn, stream)
-	c := proto.NewConn(qconn)
+	// Оборачиваем (conn + stream) в net.Conn-подобный интерфейс
+	// чтобы дальше использовать ту же логику, что и для TCP
+	conn := quicconn.New(qconn, stream)
 
-	msgType, args, err := c.Recv()
-	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("quic: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
-		c.Send(proto.MsgError, "invalid session request")
-		return
-	}
-	sessionID := args[0]
+	protoConn := proto.NewConn(conn)
 
-	sess, ok := sessions.Get(sessionID)
-	if !ok {
-		log.Printf("quic: неизвестная сессия %s", sessionID)
-		c.Send(proto.MsgError, "session not found")
-		return
-	}
-
-	target, err := net.Dial("tcp", sess.TargetAddr)
+	// Передаём в общий обработчик
+	sess, err := prepareDataConn(protoConn, "quic")
 	if err != nil {
-		log.Printf("quic: не могу подключиться к %s: %v", sess.TargetAddr, err)
-		c.Send(proto.MsgError, "target connection failed")
+		log.Printf("error in preparing DataConn: %v", err)
 		return
 	}
-	defer target.Close()
 
-	pipe.TuneConn(target)
-	c.Send(proto.MsgOK)
+	defer sessionMetrics.Delete(sess.ID)
 
-	log.Printf("quic: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	err1, err2 := pipe.PipeWithDone(qconn, target, sess.Done())
-	log.Printf("quic: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+	switch sess.Mode {
+	case session.Mstsc:
+		target, err := connectToTarget(protoConn, sess, "quic")
+		if err != nil {
+			log.Printf("error in connecting to target: %v", err)
+			return
+		}
+		defer target.Close()
+		handleDataDefault(conn, target, sess, "quic")
+
+	case session.Freerdp:
+		// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
+		if err := protoConn.Send(proto.MsgOK); err != nil {
+			return
+		}
+		handleDataFreerdp(qconn, protoConn, sess)
+	}
 }
 
-// listenTCPData — принимает tcp data-соединения и проксирует на целевую машину
-func listenTCPData(addr, certPath, keyPath string) {
+/*
+Подготавливаем соединение на DataPlane:
+Получаем сессию от клиента TODO: проверить нельзя ли на этом этапе клиенту дать нам любой id сессии
+Возвращаем объект сессии (там классификация соединения)
+*/
+func prepareDataConn(conn *proto.Conn, protoName string) (*session.Session, error) {
+
+	// Убираем задержки и Нейгла
+	pipe.TuneConn(conn.RawConn())
+
+	// Ожидаем первое сообщение от клиента: SESSION <id>
+	msgType, args, err := conn.Recv()
+	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
+		log.Printf("%s: ожидал SESSION, получил: %v %v err=%v", protoName, msgType, args, err)
+		conn.Send(proto.MsgError, "invalid session request")
+		return nil, fmt.Errorf("invalid session request")
+	}
+	sessionId := args[0]
+
+	// Ищем сессию, которую ранее создали на control-plane
+	sess, ok := sessions.Get(sessionId)
+	if !ok {
+		log.Printf("%s: неизвестная сессия %s", protoName, sessionId)
+		conn.Send(proto.MsgError, "session not found")
+		return nil, fmt.Errorf("session not found")
+	}
+
+	// Benchmark сессия — отдельный обработчик без подключения к машине
+	// if sess.MachineID == "benchmark" {
+	// 	handleBenchmarkData(conn, c, sess, sessionId)
+	// 	return
+	// }
+
+	log.Printf("%s: [%s] старт -> %s", protoName, sessionId[:8], sess.TargetAddr)
+
+	return sess, nil
+
+	// MeteredReader прозрачно считает метрики входящего потока
+	// meteredRaw := metrics.NewMeteredConn(conn, m)
+
+	// // Дальше просто проксируем трафик в обе стороны до завершения сессии
+	// // conn — клиент (TLS или QUIC)
+	// // target — целевой сервер
+	// err1, err2 := pipe.PipeWithDone(meteredRaw, target, sess.Done())
+
+	// log.Printf("%s: [%s] завершено err1=%v err2=%v", protoName, sessionId[:8], err1, err2)
+}
+
+/*
+Соединяемся с таргет-машиной
+Создаём коллектор метрик
+*/
+func connectToTarget(conn *proto.Conn, sess *session.Session, protoName string) (net.Conn, error) {
+
+	// Подключаемся к целевой машине (RDP сервер или любой TCP target)
+	target, err := net.Dial("tcp", sess.TargetAddr)
+	if err != nil {
+		log.Printf("%s: не могу подключиться к %s: %v", protoName, sess.TargetAddr, err)
+		conn.Send(proto.MsgError, "target connection failed")
+		return nil, fmt.Errorf("target connection failed: %v", err)
+	}
+
+	// Оптимизируем TCP-соединение (nodelay, буферы и т.п.)
+	pipe.TuneConn(target)
+
+	// Создаём коллектор метрик для этой сессии
+	// Измеряем входящий трафик (клиент → сервер)
+	// Обоснование: участок сервер → машина симметричен и находится
+	// в локальной сети без деградации (см. методологию)
+	m := metrics.NewStreamMetrics()
+	sessionMetrics.Store(sess.ID, m)
+	//defer sessionMetrics.Delete(sessionId)
+
+	// Сообщаем клиенту, что всё готово и можно начинать проксирование данных
+	if err := conn.Send(proto.MsgOK); err != nil {
+		target.Close()
+		sessionMetrics.Delete(sess.ID)
+		return nil, err
+	}
+
+	return target, nil
+}
+
+// Проксирование данных одним потоком
+func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, protoName string) {
+	// MeteredReader прозрачно считает метрики входящего потока
+	value, ok := sessionMetrics.Load(sess.ID)
+	if !ok || value == nil {
+		log.Printf("error in getting metrics by session id: %v", sess.ID)
+		return
+	}
+	m := value.(*metrics.StreamMetrics)
+	meteredRaw := metrics.NewMeteredConn(conn, m)
+
+	// Дальше просто проксируем трафик в обе стороны до завершения сессии
+	// conn — клиент (TLS или QUIC)
+	// target — целевой сервер
+	err1, err2 := pipe.PipeWithDone(meteredRaw, target, sess.Done())
+
+	log.Printf("%s: [%s] завершено err1=%v err2=%v", protoName, sess.ID[:8], err1, err2)
+}
+
+// handleDataFreerdp — фаза 1: сырой relay негоциации между xfreerdp-quic (через
+// клиента) и pf_server; фаза 2 (после SWITCH_CHANNELS): 4 QUIC-стрима напрямую
+// в unix-сокеты, которые уже льёт наш C-модуль quicmux внутри pf_server.
+func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session) {
+	agent, ok := agentpool.Get(sess.MachineID)
+	if !ok {
+		log.Printf("freerdp: [%s] нет подключённого агента для %s", sess.ID[:8], sess.MachineID)
+		ctrl.Send(proto.MsgError, "agent not connected")
+		return
+	}
+
+	// Поднимаем relay до pf_server ЗАРАНЕЕ — до того как клиент вообще
+	// откроет локальный порт для xfreerdp-quic
+	agentRelayStream, err := agent.RequestRelay(sess.ID, 10*time.Second)
+	if err != nil {
+		log.Printf("freerdp: [%s] не удалось получить relay от агента: %v", sess.ID[:8], err)
+		ctrl.Send(proto.MsgError, "agent relay failed")
+		return
+	}
+
+	if err := ctrl.Send(proto.MsgRelayReady); err != nil {
+		log.Printf("freerdp: не удалось отправить RELAY_READY: %v", err)
+		agentRelayStream.Close()
+		return
+	}
+
+	relayStream, err := qconn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("freerdp: accept relay stream: %v", err)
+		return
+	}
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		bridgeQuicStreams("Фиктивное соединение", relayStream, agentRelayStream)
+		log.Printf("freerdp: [%s] фаза 1 relay завершена", sess.ID[:8])
+	}()
+
+	msgType, _, err := ctrl.Recv() // ждём SWITCH_CHANNELS
+	if err != nil || msgType != proto.MsgSwitchChannels {
+		log.Printf("freerdp: не дождались SWITCH_CHANNELS: %v %v", msgType, err)
+		relayStream.Close()
+		agentRelayStream.Close()
+		<-relayDone
+		return
+	}
+
+	// relayStream.Close()
+	// agentRelayStream.Close()
+	// <-relayDone
+
+	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
+	if err != nil {
+		log.Printf("freerdp: [%s] не удалось получить мост от агента: %v", sess.ID[:8], err)
+		ctrl.Send(proto.MsgError, "agent bridge failed")
+		return
+	}
+
+	if err := ctrl.Send(proto.MsgOK); err != nil {
+		log.Printf("freerdp: не удалось подтвердить переключение клиенту: %v", err)
+		return
+	}
+
+	clientStreams := make([]*quic.Stream, bridge.ChannelCount)
+	for i := 0; i < bridge.ChannelCount; i++ {
+		stream, err := qconn.AcceptStream(context.Background())
+		if err != nil {
+			log.Printf("freerdp: accept stream %s: %v", bridge.ChannelNames[i], err)
+			return
+		}
+		clientStreams[i] = stream
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < bridge.ChannelCount; i++ {
+		wg.Add(1)
+		go func(a, b *quic.Stream) {
+			defer wg.Done()
+			bridgeQuicStreams(bridge.ChannelNames[i], a, b)
+		}(clientStreams[i], agentStreams[i])
+	}
+	wg.Wait()
+
+	log.Printf("handleDataFreerdp: [%s] завершён", sess.ID[:8])
+}
+
+// bridgeQuicStreams гоняет байты между двумя QUIC-стримами в обе стороны —
+// клиентским (к xfreerdp-quic) и агентским (к quicmux на таргет-машине).
+func bridgeQuicStreams(name string, a, b *quic.Stream) {
+	done := make(chan struct{}, 2)
+	go func() {
+		n, err := io.Copy(a, b)
+		log.Printf("[%s] agent→client: скопировано %d байт, err=%v", name, n, err)
+		a.Close()
+		done <- struct{}{}
+	}()
+	go func() {
+		n, err := io.Copy(b, a)
+		log.Printf("[%s] client→agent: скопировано %d байт, err=%v", name, n, err)
+		b.Close()
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+}
+
+// handleBenchmarkData - обработка бенчмарка (только client-server)
+// принимает уже созданный proto.Conn
+func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, sessionId string) {
+	m := metrics.NewStreamMetrics()
+	if sess.BenchClientIntervalMs > 0 {
+		m.SetExpectedInterval(
+			time.Duration(sess.BenchClientIntervalMs) * time.Millisecond,
+		)
+	}
+	sessionMetrics.Store(sessionId, m)
+	defer sessionMetrics.Delete(sessionId)
+
+	c.Send(proto.MsgOK)
+	log.Printf("bench: [%s] старт", sessionId[:8])
+
+	// Буфер для чтения пакетов
+	// Используем MeteredConn для подсчёта байт и jitter
+	meteredRaw := metrics.NewMeteredConn(raw, m)
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-sess.Done():
+			log.Printf("bench: [%s] сессия отозвана", sessionId[:8])
+			return
+		default:
+		}
+		raw.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := meteredRaw.Read(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			log.Printf("bench: [%s] завершено: %v", sessionId[:8], err)
+			return
+		}
+
+		// Echo — отправляем пакет обратно клиенту без изменений.
+		// Клиент по timestamp внутри пакета посчитает RTT.
+		// Используем raw (не meteredRaw) чтобы не считать echo как входящий трафик.
+		if n > 0 {
+			raw.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			raw.Write(buf[:n])
+			raw.SetWriteDeadline(time.Time{})
+		}
+	}
+}
+
+func listenAgentData(addr, certPath, keyPath, caCertPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("data tls cert: %v", err)
+		log.Fatalf("agent tls cert: %v", err)
 	}
-	tlsCfg := tls.Config{
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		log.Fatalf("agent read ca: %v", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("agent parse ca cert")
+	}
+	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS13,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caPool,
+		NextProtos:   []string{"rdp-zero-trust-agent"},
 	}
 
-	ln, err := tls.Listen("tcp", addr, &tlsCfg)
+	ln, err := quic.ListenAddr(addr, tlsCfg, &quic.Config{
+		MaxIdleTimeout:  5 * time.Minute,
+		KeepAlivePeriod: 10 * time.Second,
+	})
 	if err != nil {
-		log.Fatalf("data listen: %v", err)
+		log.Fatalf("agent listen: %v", err)
 	}
-	log.Printf("data plane (TLS) слушает %s", addr)
+	log.Printf("agent plane (QUIC mTLS) слушает %s", addr)
 
 	for {
-		conn, err := ln.Accept()
+		qconn, err := ln.Accept(context.Background())
 		if err != nil {
-			log.Printf("data accept: %v", err)
+			log.Printf("agent accept: %v", err)
 			continue
 		}
-		go handleData(conn)
+		go handleAgentConn(qconn)
 	}
 }
 
-// handleData — первая строка от клиента: SESSION <id>
-func handleData(raw net.Conn) {
-	defer raw.Close()
-
-	// raw принятый по tls.Listen лишь реализует интерфейс net.Conn, внутри он tls.Conn
-	// Но это не проблема, тк его настройки уже заданы на клиенте
-	// Смысла в TuneConn просто нет
-	// pipe.TuneConn(raw)
-
-	c := proto.NewConn(raw)
-
-	msgType, args, err := c.Recv()
-	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("data: ожидал SESSION, получил: %v %v err=%v", msgType, args, err)
-		c.Send(proto.MsgError, "invalid session request")
-		return
-	}
-	sessionID := args[0]
-
-	sess, ok := sessions.Get(sessionID)
-	if !ok {
-		log.Printf("data: неизвестная сессия %s", sessionID)
-		c.Send(proto.MsgError, "session not found")
-		return
-	}
-
-	log.Printf("data: [%s] НАЧАЛО - подключение -> %s", sessionID[:8], sess.TargetAddr)
-
-	target, err := net.Dial("tcp", sess.TargetAddr)
+func handleAgentConn(qconn *quic.Conn) {
+	ctrlStream, err := qconn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("data: не могу подключиться к %s: %v", sess.TargetAddr, err)
-		c.Send(proto.MsgError, "target connection failed")
+		log.Printf("agent: accept ctrl stream: %v", err)
+		qconn.CloseWithError(0, "no ctrl stream")
 		return
 	}
-	defer target.Close()
+	ctrl := proto.NewConn(quicconn.New(qconn, ctrlStream))
 
-	// target по tcp и он реально *net.TCPConn
-	pipe.TuneConn(target)
+	msgType, args, err := ctrl.Recv()
+	if err != nil || msgType != proto.MsgRegister || len(args) == 0 {
+		ctrl.Send(proto.MsgError, "expected REGISTER <machine_id>")
+		return
+	}
+	machineID := args[0]
 
-	// Отправляем подтверждение: сервер готов к передаче RDP данных
-	c.Send(proto.MsgOK)
+	// TODO: сверить machineID с CN из клиентского сертификата агента —
+	// сейчас доверяем значению из REGISTER как есть, это временное упрощение
+	if err := ctrl.Send(proto.MsgOK); err != nil {
+		return
+	}
 
-	log.Printf("data: [%s] старт -> %s", sessionID[:8], sess.TargetAddr)
-	// После handshake буфер reader пуст — передаём raw напрямую
-	err1, err2 := pipe.PipeWithDone(raw, target, sess.Done())
-	log.Printf("data: [%s] завершено err1=%v err2=%v", sessionID[:8], err1, err2)
+	agent := agentpool.Register(machineID, qconn, ctrl)
+	log.Printf("agent: зарегистрирован %s", machineID)
+
+	<-qconn.Context().Done()
+	agentpool.Unregister(machineID, agent)
+	log.Printf("agent: отключился %s", machineID)
 }

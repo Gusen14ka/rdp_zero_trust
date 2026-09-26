@@ -10,11 +10,17 @@ import (
 
 // Типы сообщений
 const (
-	MsgHello   = "HELLO"
-	MsgConnect = "CONNECT"
-	MsgSession = "SESSION"
-	MsgOK      = "OK"
-	MsgError   = "ERROR"
+	MsgHello          = "HELLO"
+	MsgConnect        = "CONNECT"
+	MsgBench          = "BENCH"
+	MsgSession        = "SESSION"
+	MsgOK             = "OK"
+	MsgError          = "ERROR"
+	MsgSwitchChannels = "SWITCH_CHANNELS"
+	MsgRegister       = "REGISTER"
+	MsgOpenRelay      = "OPEN_RELAY"
+	MsgOpenBridge     = "OPEN_BRIDGE"
+	MsgRelayReady     = "RELAY_READY"
 )
 
 // Таймауты

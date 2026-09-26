@@ -4,11 +4,28 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
 
 const DefaultTTL = 60 * time.Minute
+
+type ModeType string
+
+const (
+	Freerdp ModeType = "freerdp"
+	Mstsc   ModeType = "mstsc"
+)
+
+func (m ModeType) Validate() bool {
+	switch m {
+	case Freerdp, Mstsc:
+		return true
+	default:
+		return false
+	}
+}
 
 type Session struct {
 	ID         string
@@ -17,10 +34,15 @@ type Session struct {
 	TargetAddr string
 	CreatedAt  time.Time
 	ExpiresAt  time.Time
+	Mode       ModeType
 
 	// cancel закрывается когда сессия должна завершиться —
 	// control plane горутина читает из него и рвёт соединение
 	cancel chan struct{}
+
+	// BenchClientIntervalMs — ожидаемый интервал между пакетами клиента.
+	// Заполняется только для benchmark сессий, для обычных = 0.
+	BenchClientIntervalMs int
 }
 
 // Cancel принудительно завершает сессию
@@ -49,7 +71,40 @@ func NewStore() *Store {
 	}
 }
 
-func (s *Store) Create(username, machineID, targetAddr string, ttl time.Duration) (*Session, error) {
+func (s *Store) Create(username, machineID, targetAddr, mode string, ttl time.Duration) (*Session, error) {
+	id, err := randomID()
+	if err != nil {
+		return nil, fmt.Errorf("generate session id: %w", err)
+	}
+
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	modeValue := ModeType(mode)
+	if !modeValue.Validate() {
+		return nil, fmt.Errorf("unknown mode type: %s", mode)
+	}
+
+	now := time.Now()
+	sess := &Session{
+		ID:                    id,
+		Username:              username,
+		MachineID:             machineID,
+		TargetAddr:            targetAddr,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(ttl),
+		Mode:                  modeValue,
+		cancel:                make(chan struct{}),
+		BenchClientIntervalMs: 0,
+	}
+
+	s.mu.Lock()
+	s.sessions[id] = sess
+	s.mu.Unlock()
+
+	return sess, nil
+}
+
+// CreateBench создаёт benchmark сессию с дополнительными параметрами.
+func (s *Store) CreateBench(username string, ttl time.Duration, clientIntervalMs int) (*Session, error) {
 	id, err := randomID()
 	if err != nil {
 		return nil, fmt.Errorf("generate session id: %w", err)
@@ -57,13 +112,14 @@ func (s *Store) Create(username, machineID, targetAddr string, ttl time.Duration
 
 	now := time.Now()
 	sess := &Session{
-		ID:         id,
-		Username:   username,
-		MachineID:  machineID,
-		TargetAddr: targetAddr,
-		CreatedAt:  now,
-		ExpiresAt:  now.Add(ttl),
-		cancel:     make(chan struct{}),
+		ID:                    id,
+		Username:              username,
+		MachineID:             "benchmark",
+		TargetAddr:            "benchmark",
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(ttl),
+		cancel:                make(chan struct{}),
+		BenchClientIntervalMs: clientIntervalMs,
 	}
 
 	s.mu.Lock()

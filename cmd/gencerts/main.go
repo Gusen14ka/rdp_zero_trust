@@ -88,7 +88,7 @@ func generateServerCert(caKey *ecdsa.PrivateKey, caCert *x509.Certificate) (*ecd
 		// Прописываем IP и DNS по которым будет доступен сервер
 		IPAddresses: []net.IP{
 			net.ParseIP("127.0.0.1"),
-			net.ParseIP("192.168.0.21"), // IP твоего сервера
+			net.ParseIP("192.168.56.102"), // IP твоего сервера
 		},
 		DNSNames: []string{
 			"localhost",

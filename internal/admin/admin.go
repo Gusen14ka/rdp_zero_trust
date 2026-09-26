@@ -4,17 +4,23 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
+	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/session"
 )
 
 type Server struct {
-	sessions *session.Store
+	sessions       *session.Store
+	sessionMetrics *sync.Map
 }
 
-func NewServer(sessions *session.Store) *Server {
-	return &Server{sessions: sessions}
+func NewServer(sessions *session.Store, sessionMetrics *sync.Map) *Server {
+	return &Server{
+		sessions:       sessions,
+		sessionMetrics: sessionMetrics,
+	}
 }
 
 // Start запускает HTTP сервер только на localhost —
@@ -25,6 +31,7 @@ func (s *Server) Start(addr string) {
 	mux.HandleFunc("GET /sessions", s.listSessions)
 	mux.HandleFunc("DELETE /sessions/{id}", s.deleteSession)
 	mux.HandleFunc("DELETE /users/{username}/sessions", s.deleteUserSessions)
+	mux.HandleFunc("GET /sessions/{id}/metrics", s.getMetrics)
 
 	log.Printf("admin HTTP слушает %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -98,4 +105,28 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+func (s *Server) getMetrics(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+
+	val, ok := s.sessionMetrics.Load(id)
+	if !ok {
+		http.Error(w, "metrics not found for session", http.StatusNotFound)
+		return
+	}
+
+	m, ok := val.(*metrics.StreamMetrics)
+	if !ok {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	snap := m.Snapshot()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
 }

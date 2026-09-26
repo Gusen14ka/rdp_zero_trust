@@ -651,10 +651,10 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	var wg sync.WaitGroup
 	for i := 0; i < bridge.ChannelCount; i++ {
 		wg.Add(1)
-		go func(a, b *quic.Stream) {
+		go func(name string, a, b *quic.Stream) {
 			defer wg.Done()
-			bridgeQuicStreams(bridge.ChannelNames[i], a, b)
-		}(clientStreams[i], agentStreams[i])
+			bridgeQuicStreams(name, a, b)
+		}(bridge.ChannelNames[i], clientStreams[i], agentStreams[i])
 	}
 	wg.Wait()
 

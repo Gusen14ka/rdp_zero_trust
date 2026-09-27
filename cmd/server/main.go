@@ -625,13 +625,18 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 		slog.Info("freerdp: фаза 1 relay завершена", "session_id", sess.ID[:8])
 	}()
 
-	msgType, _, err := ctrl.Recv() // ждём SWITCH_CHANNELS
+	msgType, args, err := ctrl.Recv() // ждём SWITCH_CHANNELS <muxMode>
 	if err != nil || msgType != proto.MsgSwitchChannels {
 		slog.Error("freerdp: не дождались SWITCH_CHANNELS", "msg_type", msgType, "err", err)
 		relayStream.Close()
 		agentRelayStream.Close()
 		<-relayDone
 		return
+	}
+
+	muxMode := "multi"
+	if len(args) > 0 {
+		muxMode = args[0]
 	}
 
 	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
@@ -643,6 +648,46 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 
 	if err := ctrl.Send(proto.MsgOK); err != nil {
 		slog.Error("freerdp: не удалось подтвердить переключение клиенту", "err", err)
+		return
+	}
+
+	if muxMode == "single" {
+		stream, err := qconn.AcceptStream(context.Background())
+		if err != nil {
+			slog.Error("freerdp: accept mux stream:", "err", err)
+			return
+		}
+		pc := proto.NewConn(quicconn.New(qconn, stream))
+		msgType, args, err := pc.Recv()
+		if err != nil || msgType != proto.MsgSession || len(args) < 2 || args[1] != "mux" {
+			slog.Error("freerdp: некорректный хендшейк mux-стрима:", "msg_type", msgType, "args", args, "err", err)
+			return
+		}
+		if err := pc.Send(proto.MsgOK); err != nil {
+			slog.Error("freerdp: не удалось подтвердить mux-стрим:", "err", err)
+			return
+		}
+
+		chans := make([]io.ReadWriter, bridge.ChannelCount)
+		for i := range chans {
+			chans[i] = agentStreams[i]
+		}
+		rw := struct {
+			io.Reader
+			io.Writer
+		}{pc.Reader(), stream}
+
+		slog.Info("freerdp: режим single", "sess id", sess.ID[:8])
+		bridge.BridgeMux(chans, rw)
+
+		// Агентское соединение постоянное — явно закрываем его стримы,
+		// иначе мост на агенте останется висеть после конца сессии
+		for _, s := range agentStreams {
+			s.CancelRead(0)
+			s.Close()
+		}
+		stream.Close()
+		slog.Info("handleDataFreerdp: завершён (single)", "sess id", sess.ID[:8])
 		return
 	}
 

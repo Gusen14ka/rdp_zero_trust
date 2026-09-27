@@ -3,6 +3,7 @@ package proto
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -74,4 +75,11 @@ func (c *Conn) Close() error {
 // RawConn возвращает исходный net.Conn (нужен для data plane)
 func (c *Conn) RawConn() net.Conn {
 	return c.conn
+}
+
+// Reader возвращает буферизованный reader соединения. После текстового
+// хендшейка бинарные данные нужно читать через него: bufio мог прочитать
+// часть следующих байт наперёд, и при чтении напрямую из стрима они потеряются.
+func (c *Conn) Reader() io.Reader {
+	return c.reader
 }

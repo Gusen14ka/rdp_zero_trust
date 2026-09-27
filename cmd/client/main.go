@@ -37,6 +37,7 @@ func main() {
 	mode := flag.String("mode", "freerdp", "режим работы: mstsc или freerdp")
 	logLevel := flag.String("log-level", "info", "log level")
 	record := flag.String("record", "", "путь к CSV для записи метрик PDU (пусто = не писать)")
+	mux := flag.String("mux", "multi", "режим каналов: multi (стрим на канал) или single (все каналы в одном стриме)")
 	flag.Parse()
 
 	// Настриваем логгер
@@ -54,6 +55,11 @@ func main() {
 		defer rec.Close()
 	}
 
+	// Тип передачи каналов quic
+	if *mux != "multi" && *mux != "single" {
+		logging.Fatalf("неизвестный: ", "-mux", *mux)
+	}
+
 	// Шаг 1: control plane — аутентификация и запрос машины
 	sessionId, err := authenticate(*serverAddr, *username, *password, *machineId,
 		*caPath, *clientCertPath, *clientKeyPath, *mode)
@@ -66,13 +72,13 @@ func main() {
 	case "mstsc":
 		runMstscMode(*localAddr, *dataAddr, *transport, sessionId, *caPath)
 	case "freerdp":
-		runFreerdpMode(*localAddr, *dataAddr, sessionId, *caPath)
+		runFreerdpMode(*localAddr, *dataAddr, sessionId, *caPath, *mux)
 	}
 
 }
 
 // Реализация пайплайна с подключением в freerdp
-func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
+func runFreerdpMode(localAddr, dataAddr, sessionID, caPath, muxMode string) {
 	slog.Info("режим freerdp: ждём подключения xfreerdp-quic...")
 
 	// TODO: 2 и 3 шаги вынести в отдельную функцию и объединить с tunnelQUIC
@@ -198,7 +204,7 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		bridge.Rec.Mark("relay_ready")
 	}
 
-	c.Send(proto.MsgSwitchChannels)
+	c.Send(proto.MsgSwitchChannels, muxMode)
 	msgType, args, err = c.Recv()
 	if err != nil || msgType != proto.MsgOK {
 		logging.Fatalf("сервер не подтвердил переключение:",
@@ -209,6 +215,36 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 
 	if bridge.Rec != nil {
 		bridge.Rec.Mark("switch_channels")
+	}
+
+	// TODO: вынести в отдельную функцию
+	if muxMode == "single" {
+		stream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			logging.Fatalf("open mux stream:", "err", err)
+		}
+		pc := proto.NewConn(quicconn.New(conn, stream))
+		if err := pc.Send(proto.MsgSession, sessionID, "mux"); err != nil {
+			logging.Fatalf("handshake mux-стрима:", "err", err)
+		}
+		if msgType, _, err := pc.Recv(); err != nil || msgType != proto.MsgOK {
+			logging.Fatalf("сервер не подтвердил mux-стрим:", "err", err)
+		}
+
+		chans := make([]io.ReadWriter, bridge.ChannelCount)
+		for i := range chans {
+			chans[i] = unixConns[i]
+		}
+		// Читаем через буфер proto.Conn: в нём уже может лежать начало первого кадра
+		rw := struct {
+			io.Reader
+			io.Writer
+		}{pc.Reader(), stream}
+
+		slog.Info(fmt.Sprintf("режим single: все каналы в одном стриме (id=%d)", stream.StreamID()))
+		bridge.BridgeMux(chans, rw)
+		slog.Info("runFreerdpMode завершён")
+		return
 	}
 
 	// Шаг 4: открываем отдельный QUIC стрим для каждого канала

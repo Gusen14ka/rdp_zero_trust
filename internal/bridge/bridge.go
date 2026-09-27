@@ -172,6 +172,10 @@ func forwardPDUs(wg *sync.WaitGroup, src io.Reader, dst io.Writer,
 			return
 		}
 
+		if Rec != nil {
+			Rec.Record(name, direction, len(pdu))
+		}
+
 		slog.Debug(fmt.Sprintf("[%s] %s %d bytes",
 			name,
 			direction,

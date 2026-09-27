@@ -36,11 +36,22 @@ func main() {
 	transport := flag.String("transport", "tcp", "транспорт data plane: tcp или quic")
 	mode := flag.String("mode", "freerdp", "режим работы: mstsc или freerdp")
 	logLevel := flag.String("log-level", "info", "log level")
+	record := flag.String("record", "", "путь к CSV для записи метрик PDU (пусто = не писать)")
 	flag.Parse()
 
-	//Настриваем логгер
+	// Настриваем логгер
 	if err := logging.Configure(*logLevel); err != nil {
 		logging.Fatalf("failed to configure logger", "err", err)
+	}
+
+	// Настраиваем benchmark record
+	if *record != "" {
+		rec, err := bridge.NewRecorder(*record)
+		if err != nil {
+			logging.Fatalf("recorder:", "err", err)
+		}
+		bridge.Rec = rec
+		defer rec.Close()
 	}
 
 	// Шаг 1: control plane — аутентификация и запрос машины
@@ -174,6 +185,10 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	// relayStream.Close()
 	// <-relayDone
 
+	if bridge.Rec != nil {
+		bridge.Rec.Mark("relay_ready")
+	}
+
 	c.Send(proto.MsgSwitchChannels)
 	msgType, args, err = c.Recv()
 	if err != nil || msgType != proto.MsgOK {
@@ -181,6 +196,10 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 			"msgType", msgType,
 			"args", args,
 			"err", err)
+	}
+
+	if bridge.Rec != nil {
+		bridge.Rec.Mark("switch_channels")
 	}
 
 	// Шаг 4: открываем отдельный QUIC стрим для каждого канала

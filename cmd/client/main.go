@@ -83,12 +83,18 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	}
 	tlsCfg.NextProtos = []string{"rdp-zero-trust"}
 
+	if bridge.Rec != nil {
+		bridge.Rec.Mark("dial_start")
+	}
 	conn, err := quic.DialAddr(context.Background(), dataAddr, tlsCfg, &quic.Config{
 		MaxIdleTimeout:  5 * time.Minute,
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
 		logging.Fatalf("quic dial:", "err", err)
+	}
+	if bridge.Rec != nil {
+		bridge.Rec.Mark("dial_done")
 	}
 	defer conn.CloseWithError(0, "done")
 
@@ -154,6 +160,9 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	ln.Close()
 	if err != nil {
 		logging.Fatalf("accept from xfreerdp-quic:", "err", err)
+	}
+	if bridge.Rec != nil {
+		bridge.Rec.Mark("local_accept")
 	}
 
 	relayDone := make(chan struct{})

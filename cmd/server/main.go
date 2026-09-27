@@ -7,7 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -23,6 +23,7 @@ import (
 	"rdp_zero_trust/internal/config"
 	enrollServer "rdp_zero_trust/internal/enrollment/server"
 	"rdp_zero_trust/internal/identity"
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/netem"
 	"rdp_zero_trust/internal/pipe"
@@ -56,7 +57,12 @@ func main() {
 	ttl := flag.Duration("ttl", session.DefaultTTL, "TTL сессии")
 	netIface := flag.String("iface", "enp0s3", "сетевой интерфейс для tc netem")
 	agentAddr := flag.String("agent", ":9004", "адрес agent plane (QUIC)")
+	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
+
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
 
 	sessionTtl = *ttl
 
@@ -64,9 +70,9 @@ func main() {
 	var err error
 	cfg, err = config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		logging.Fatalf("config", "err", err)
 	}
-	log.Printf("загружено машин: %d, пользователей: %d", len(cfg.Machines), len(cfg.Users))
+	slog.Info("config loaded", "machines", len(cfg.Machines), "users", len(cfg.Users))
 
 	sessions = session.NewStore()
 
@@ -75,14 +81,14 @@ func main() {
 	// Enrollment сервер
 	enrollSrv, err := enrollServer.NewServer(*caKeyPath, "certs/ca.crt")
 	if err != nil {
-		log.Fatalf("enrollment server: %v", err)
+		logging.Fatalf("enrollment server", "err", err)
 	}
 	// Регистрируем способ аутентификации — пароль
 	// Чтобы добавить TOTP: enrollSrv.RegisterAuth(enrollment.NewTOTPAuthHandler(...))
 	enrollSrv.RegisterAuth(enrollServer.NewPasswordAuthHandler(cfg))
 	go func() {
 		if err := enrollSrv.Start(*enrollAddr, *certPath, *keyPath); err != nil {
-			log.Fatalf("enrollment: %v", err)
+			logging.Fatalf("enrollment", "err", err)
 		}
 	}()
 
@@ -104,17 +110,17 @@ func listenControl(addr, certPath, keyPath, caCertPath string) {
 	// Загружаем сертификат сервера
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("tls cert: %v", err)
+		logging.Fatalf("tls cert", "err", err)
 	}
 
 	// Загружаем сертификат CA и создаем пул
 	caCert, err := os.ReadFile(caCertPath)
 	if err != nil {
-		log.Fatalf("read ca: %v", err)
+		logging.Fatalf("read ca", "err", err)
 	}
 	caPool := x509.NewCertPool()
 	if !caPool.AppendCertsFromPEM(caCert) {
-		log.Fatalf("parse ca cert")
+		logging.Fatalf("parse ca cert", "err", err)
 	}
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -125,21 +131,21 @@ func listenControl(addr, certPath, keyPath, caCertPath string) {
 
 	ln, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
-		log.Fatalf("control listen: %v", err)
+		logging.Fatalf("control listen", "err", err)
 	}
-	log.Printf("control plane (mTLS) слушает %s", addr)
+	slog.Info("control plane (mTLS) слушает", "addr", addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("control accept error: %v", err)
+			slog.Error("control accept error", "err", err)
 			continue
 		}
 		// У нас tls поверх соединения - берём его
 		tlsConn, ok := conn.(*tls.Conn)
 		if !ok {
 			conn.Close()
-			log.Printf("client-control plane is not tls")
+			slog.Warn("client-control plane is not tls")
 			continue
 		}
 		go handleControl(tlsConn)
@@ -151,18 +157,18 @@ func handleControl(tlsConn *tls.Conn) {
 	c := proto.NewConn(tlsConn)
 	defer c.Close()
 
-	log.Printf("новое control-соединение от %s", tlsConn.RemoteAddr())
+	slog.Info("новое control-соединение", "remote_addr", tlsConn.RemoteAddr())
 
 	// Из-за ленивой оптимизации go может провести handshake после Accept
 	// Говорим ему сделать его прямо сейчас, тк нам нужно взять сертификат client
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("handshake failed: %v", err)
+		slog.Warn("handshake failed", "err", err)
 		return
 	}
 
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		log.Printf("no client certificate")
+		slog.Warn("no client certificate")
 		return
 	}
 
@@ -170,11 +176,11 @@ func handleControl(tlsConn *tls.Conn) {
 
 	certUsername, err := identity.UsernameFromCert(cert)
 	if err != nil {
-		log.Printf("invalid certificate: %v", err)
+		slog.Warn("invalid certificate", "err", err)
 		return
 	}
 
-	log.Printf("control: подключился %s (из SAN)", certUsername)
+	slog.Info("control: подключился", "cert_username", certUsername)
 
 	// Шаг 1: HELLO <username> <password>
 	msgType, args, err := c.Recv()
@@ -187,18 +193,18 @@ func handleControl(tlsConn *tls.Conn) {
 	// Проверка 1: SAN vs сообщение
 	if username != certUsername {
 		c.Send(proto.MsgError, "certificate username mismatch")
-		log.Printf("mTLS mismatch: cert=%s msg=%s", certUsername, username)
+		slog.Warn("mTLS mismatch", "cert_username", certUsername, "msg_username", username)
 		return
 	}
 
 	// Проверка 2: пароль (второй фактор)
 	if !cfg.Authenticate(username, password) {
 		c.Send(proto.MsgError, "invalid credentials")
-		log.Printf("[%s] неверный пароль", username)
+		slog.Warn("неверный пароль", "username", username)
 		return
 	}
 
-	log.Printf("[%s] аутентифицирован (mTLS + пароль)", username)
+	slog.Info("аутентифицирован (mTLS + пароль)", "username", username)
 	c.Send(proto.MsgOK)
 
 	// Шаг 2: CONNECT <machine_id> или BENCH <net params>
@@ -228,7 +234,7 @@ func handleConnectRequest(c *proto.Conn, args []string, username string) {
 
 	if !cfg.CanAccess(username, machineId) {
 		c.Send(proto.MsgError, "access denied")
-		log.Printf("[%s] нет доступа к %s", username, machineId)
+		slog.Error("нет доступа к машине", "username", username, "machine_id", machineId)
 		return
 	}
 
@@ -245,8 +251,13 @@ func handleConnectRequest(c *proto.Conn, args []string, username string) {
 		return
 	}
 
-	log.Printf("[%s] сессия %s -> %s (TTL: %v, истекает: %s)",
-		username, sess.ID, machineId, sessionTtl, sess.ExpiresAt.Format("15:04:05"))
+	slog.Info("сессия создана",
+		"username", username,
+		"session_id", sess.ID,
+		"machine_id", machineId,
+		"ttl", sessionTtl,
+		"expires_at", sess.ExpiresAt.Format("15:04:05"),
+	)
 	c.Send(proto.MsgOK, sess.ID)
 
 	// Ждём одно из 3 событий:
@@ -266,17 +277,17 @@ func handleConnectRequest(c *proto.Conn, args []string, username string) {
 
 	select {
 	case <-ttlTimer.C:
-		log.Printf("сессия %s истекла по TTL", sess.ID)
+		slog.Info("сессия истекла по TTL", "session_id", sess.ID)
 		c.Send(proto.MsgError, "session expired")
 	case <-sess.Done():
-		log.Printf("сессия %s отозвана", sess.ID)
+		slog.Info("сессия отозвана", "session_id", sess.ID)
 		c.Send(proto.MsgError, "session revoked")
 	case <-clientGone:
-		log.Printf("сессия %s: клиент отключился", sess.ID)
+		slog.Info("сессия: клиент отключился", "session_id", sess.ID)
 	}
 
 	sessions.Delete(sess.ID)
-	log.Printf("сессия %s завершена (удалена)", sess.ID)
+	slog.Info("сессия завершена (удалена)", "session_id", sess.ID)
 }
 
 func handleBenchRequest(c *proto.Conn, args []string, username string) {
@@ -308,7 +319,7 @@ func handleBenchRequest(c *proto.Conn, args []string, username string) {
 		return
 	}
 
-	log.Printf("[%s] benchmark сессия %s", username, sess.ID)
+	slog.Info("benchmark сессия создана", "username", username, "session_id", sess.ID)
 	c.Send(proto.MsgOK, sess.ID)
 
 	// Держим открытым пока клиент не отключится
@@ -322,7 +333,7 @@ func handleBenchRequest(c *proto.Conn, args []string, username string) {
 	case <-sess.Done():
 		c.Send(proto.MsgError, "session revoked")
 	case <-clientGone:
-		log.Printf("benchmark сессия %s завершена", sess.ID)
+		slog.Info("benchmark сессия завершена", "session_id", sess.ID)
 	}
 
 	// Сбрасываем сетевые условия после завершения
@@ -335,7 +346,7 @@ func handleBenchRequest(c *proto.Conn, args []string, username string) {
 func listenTcpData(addr, certPath, keyPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("data tls cert: %v", err)
+		logging.Fatalf("data tls cert", "err", err)
 	}
 	tlsCfg := tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -344,14 +355,14 @@ func listenTcpData(addr, certPath, keyPath string) {
 
 	ln, err := tls.Listen("tcp", addr, &tlsCfg)
 	if err != nil {
-		log.Fatalf("data listen: %v", err)
+		logging.Fatalf("data listen", "err", err)
 	}
-	log.Printf("data plane (TLS) слушает %s", addr)
+	slog.Info("data plane (TLS) слушает", "addr", addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("data accept: %v", err)
+			slog.Error("data accept", "err", err)
 			continue
 		}
 		go handleTcpData(conn)
@@ -362,7 +373,7 @@ func listenTcpData(addr, certPath, keyPath string) {
 func listenQuicData(addr, certPath, keyPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("quic tls cert: %v", err)
+		logging.Fatalf("quic tls cert", "err", err)
 	}
 
 	// TLS конфиг для QUIC — указываем NextProtos (ALPN)
@@ -380,15 +391,15 @@ func listenQuicData(addr, certPath, keyPath string) {
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("quic listen: %v", err)
+		logging.Fatalf("quic listen", "err", err)
 	}
-	log.Printf("data plane (QUIC) слушает %s", addr)
+	slog.Info("data plane (QUIC) слушает", "addr", addr)
 
 	for {
 		// Принимаем новое QUIC соединение
 		conn, err := ln.Accept(context.Background())
 		if err != nil {
-			log.Printf("quic accept: %v", err)
+			slog.Error("quic accept", "err", err)
 			continue
 		}
 		go handleQuicData(conn)
@@ -404,7 +415,7 @@ func handleTcpData(conn net.Conn) {
 	// Подготавливаем соединение
 	sess, err := prepareDataConn(protoConn, "tcp")
 	if err != nil {
-		log.Printf("err in preparing DataConn: %v", err)
+		slog.Error("err in preparing DataConn", "proto", "tcp", "err", err)
 		return
 	}
 
@@ -414,13 +425,13 @@ func handleTcpData(conn net.Conn) {
 	case session.Mstsc:
 		target, err := connectToTarget(protoConn, sess, "tcp")
 		if err != nil {
-			log.Printf("error in connecting to target: %v", err)
+			slog.Error("error in connecting to target", "proto", "tcp", "session_id", sess.ID, "err", err)
 			return
 		}
 		handleDataDefault(conn, target, sess, "tcp")
 
 	default:
-		log.Printf("unknown session mode: %v", sess.Mode)
+		slog.Error("unknown session mode", "proto", "tcp", "mode", sess.Mode)
 		return
 	}
 }
@@ -434,7 +445,7 @@ func handleQuicData(qconn *quic.Conn) {
 	// Принимаем стрим от клиента (в QUIC данные идут через стримы)
 	stream, err := qconn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("quic accept stream: %v", err)
+		slog.Error("quic accept stream", "err", err)
 		return
 	}
 	defer stream.Close()
@@ -448,7 +459,7 @@ func handleQuicData(qconn *quic.Conn) {
 	// Передаём в общий обработчик
 	sess, err := prepareDataConn(protoConn, "quic")
 	if err != nil {
-		log.Printf("error in preparing DataConn: %v", err)
+		slog.Error("error in preparing DataConn", "proto", "quic", "err", err)
 		return
 	}
 
@@ -458,7 +469,7 @@ func handleQuicData(qconn *quic.Conn) {
 	case session.Mstsc:
 		target, err := connectToTarget(protoConn, sess, "quic")
 		if err != nil {
-			log.Printf("error in connecting to target: %v", err)
+			slog.Error("error in connecting to target", "proto", "quic", "session_id", sess.ID, "err", err)
 			return
 		}
 		defer target.Close()
@@ -486,7 +497,7 @@ func prepareDataConn(conn *proto.Conn, protoName string) (*session.Session, erro
 	// Ожидаем первое сообщение от клиента: SESSION <id>
 	msgType, args, err := conn.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) == 0 {
-		log.Printf("%s: ожидал SESSION, получил: %v %v err=%v", protoName, msgType, args, err)
+		slog.Error("ожидал SESSION", "proto", protoName, "msg_type", msgType, "args", args, "err", err)
 		conn.Send(proto.MsgError, "invalid session request")
 		return nil, fmt.Errorf("invalid session request")
 	}
@@ -495,7 +506,7 @@ func prepareDataConn(conn *proto.Conn, protoName string) (*session.Session, erro
 	// Ищем сессию, которую ранее создали на control-plane
 	sess, ok := sessions.Get(sessionId)
 	if !ok {
-		log.Printf("%s: неизвестная сессия %s", protoName, sessionId)
+		slog.Error("неизвестная сессия", "proto", protoName, "session_id", sessionId)
 		conn.Send(proto.MsgError, "session not found")
 		return nil, fmt.Errorf("session not found")
 	}
@@ -506,7 +517,7 @@ func prepareDataConn(conn *proto.Conn, protoName string) (*session.Session, erro
 	// 	return
 	// }
 
-	log.Printf("%s: [%s] старт -> %s", protoName, sessionId[:8], sess.TargetAddr)
+	slog.Info("data session start", "proto", protoName, "session_id", sessionId[:8], "target", sess.TargetAddr)
 
 	return sess, nil
 
@@ -530,7 +541,7 @@ func connectToTarget(conn *proto.Conn, sess *session.Session, protoName string) 
 	// Подключаемся к целевой машине (RDP сервер или любой TCP target)
 	target, err := net.Dial("tcp", sess.TargetAddr)
 	if err != nil {
-		log.Printf("%s: не могу подключиться к %s: %v", protoName, sess.TargetAddr, err)
+		slog.Error("не могу подключиться к target", "proto", protoName, "target", sess.TargetAddr, "err", err)
 		conn.Send(proto.MsgError, "target connection failed")
 		return nil, fmt.Errorf("target connection failed: %v", err)
 	}
@@ -561,7 +572,7 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 	// MeteredReader прозрачно считает метрики входящего потока
 	value, ok := sessionMetrics.Load(sess.ID)
 	if !ok || value == nil {
-		log.Printf("error in getting metrics by session id: %v", sess.ID)
+		slog.Error("error in getting metrics by session id", "session_id", sess.ID)
 		return
 	}
 	m := value.(*metrics.StreamMetrics)
@@ -572,7 +583,7 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 	// target — целевой сервер
 	err1, err2 := pipe.PipeWithDone(meteredRaw, target, sess.Done())
 
-	log.Printf("%s: [%s] завершено err1=%v err2=%v", protoName, sess.ID[:8], err1, err2)
+	slog.Info("session завершена", "proto", protoName, "session_id", sess.ID[:8], "err1", err1, "err2", err2)
 }
 
 // handleDataFreerdp — фаза 1: сырой relay негоциации между xfreerdp-quic (через
@@ -581,7 +592,7 @@ func handleDataDefault(conn net.Conn, target net.Conn, sess *session.Session, pr
 func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session) {
 	agent, ok := agentpool.Get(sess.MachineID)
 	if !ok {
-		log.Printf("freerdp: [%s] нет подключённого агента для %s", sess.ID[:8], sess.MachineID)
+		slog.Error("freerdp: нет подключённого агента", "session_id", sess.ID[:8], "machine_id", sess.MachineID)
 		ctrl.Send(proto.MsgError, "agent not connected")
 		return
 	}
@@ -590,20 +601,20 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	// откроет локальный порт для xfreerdp-quic
 	agentRelayStream, err := agent.RequestRelay(sess.ID, 10*time.Second)
 	if err != nil {
-		log.Printf("freerdp: [%s] не удалось получить relay от агента: %v", sess.ID[:8], err)
+		slog.Error("freerdp: не удалось получить relay от агента", "session_id", sess.ID[:8], "err", err)
 		ctrl.Send(proto.MsgError, "agent relay failed")
 		return
 	}
 
 	if err := ctrl.Send(proto.MsgRelayReady); err != nil {
-		log.Printf("freerdp: не удалось отправить RELAY_READY: %v", err)
+		slog.Error("freerdp: не удалось отправить RELAY_READY", "err", err)
 		agentRelayStream.Close()
 		return
 	}
 
 	relayStream, err := qconn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("freerdp: accept relay stream: %v", err)
+		slog.Error("freerdp: accept relay stream", "err", err)
 		return
 	}
 
@@ -611,31 +622,27 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	go func() {
 		defer close(relayDone)
 		bridgeQuicStreams("Фиктивное соединение", relayStream, agentRelayStream)
-		log.Printf("freerdp: [%s] фаза 1 relay завершена", sess.ID[:8])
+		slog.Info("freerdp: фаза 1 relay завершена", "session_id", sess.ID[:8])
 	}()
 
 	msgType, _, err := ctrl.Recv() // ждём SWITCH_CHANNELS
 	if err != nil || msgType != proto.MsgSwitchChannels {
-		log.Printf("freerdp: не дождались SWITCH_CHANNELS: %v %v", msgType, err)
+		slog.Error("freerdp: не дождались SWITCH_CHANNELS", "msg_type", msgType, "err", err)
 		relayStream.Close()
 		agentRelayStream.Close()
 		<-relayDone
 		return
 	}
 
-	// relayStream.Close()
-	// agentRelayStream.Close()
-	// <-relayDone
-
 	agentStreams, err := agent.RequestBridge(sess.ID, 10*time.Second)
 	if err != nil {
-		log.Printf("freerdp: [%s] не удалось получить мост от агента: %v", sess.ID[:8], err)
+		slog.Error("freerdp: не удалось получить мост от агента", "session_id", sess.ID[:8], "err", err)
 		ctrl.Send(proto.MsgError, "agent bridge failed")
 		return
 	}
 
 	if err := ctrl.Send(proto.MsgOK); err != nil {
-		log.Printf("freerdp: не удалось подтвердить переключение клиенту: %v", err)
+		slog.Error("freerdp: не удалось подтвердить переключение клиенту", "err", err)
 		return
 	}
 
@@ -643,31 +650,30 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	for i := 0; i < bridge.ChannelCount; i++ {
 		stream, err := qconn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("freerdp: accept client stream: %v", err)
+			slog.Error("freerdp: accept client stream", "err", err)
 			return
 		}
 
 		pc := proto.NewConn(quicconn.New(qconn, stream))
 		msgType, args, err := pc.Recv()
 		if err != nil || msgType != proto.MsgSession || len(args) < 3 {
-			log.Printf("freerdp: некорректный хендшейк клиентского стрима: %v %v err=%v",
-				msgType, args, err)
+			slog.Error("freerdp: некорректный хендшейк клиентского стрима", "msg_type", msgType, "args", args, "err", err)
 			return
 		}
 
 		idx, err := strconv.Atoi(args[2])
 		if err != nil || idx < 0 || idx >= bridge.ChannelCount || clientStreams[idx] != nil {
-			log.Printf("freerdp: некорректный индекс канала %q", args[2])
+			slog.Error("freerdp: некорректный индекс канала", "channel_index", args[2])
 			return
 		}
 
 		if err := pc.Send(proto.MsgOK); err != nil {
-			log.Printf("freerdp: не удалось подтвердить стрим: %v", err)
+			slog.Error("freerdp: не удалось подтвердить стрим", "err", err)
 			return
 		}
 
 		clientStreams[idx] = stream
-		log.Printf("freerdp: [%s] принят клиентский стрим %s", sess.ID[:8], bridge.ChannelNames[idx])
+		slog.Info("freerdp: принят клиентский стрим", "session_id", sess.ID[:8], "channel", bridge.ChannelNames[idx])
 	}
 
 	var wg sync.WaitGroup
@@ -680,7 +686,7 @@ func handleDataFreerdp(qconn *quic.Conn, ctrl *proto.Conn, sess *session.Session
 	}
 	wg.Wait()
 
-	log.Printf("handleDataFreerdp: [%s] завершён", sess.ID[:8])
+	slog.Info("handleDataFreerdp завершён", "session_id", sess.ID[:8])
 }
 
 // bridgeQuicStreams гоняет байты между двумя QUIC-стримами в обе стороны —
@@ -689,13 +695,13 @@ func bridgeQuicStreams(name string, a, b *quic.Stream) {
 	done := make(chan struct{}, 2)
 	go func() {
 		n, err := io.Copy(a, b)
-		log.Printf("[%s] agent→client: скопировано %d байт, err=%v", name, n, err)
+		slog.Debug("agent→client copy", "name", name, "bytes", n, "err", err)
 		a.Close()
 		done <- struct{}{}
 	}()
 	go func() {
 		n, err := io.Copy(b, a)
-		log.Printf("[%s] client→agent: скопировано %d байт, err=%v", name, n, err)
+		slog.Debug("client→agent copy", "name", name, "bytes", n, "err", err)
 		b.Close()
 		done <- struct{}{}
 	}()
@@ -716,7 +722,7 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 	defer sessionMetrics.Delete(sessionId)
 
 	c.Send(proto.MsgOK)
-	log.Printf("bench: [%s] старт", sessionId[:8])
+	slog.Info("bench start", "session_id", sessionId[:8])
 
 	// Буфер для чтения пакетов
 	// Используем MeteredConn для подсчёта байт и jitter
@@ -725,7 +731,7 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 	for {
 		select {
 		case <-sess.Done():
-			log.Printf("bench: [%s] сессия отозвана", sessionId[:8])
+			slog.Info("bench: session revoked", "session_id", sessionId[:8])
 			return
 		default:
 		}
@@ -735,7 +741,7 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			log.Printf("bench: [%s] завершено: %v", sessionId[:8], err)
+			slog.Info("bench завершено", "session_id", sessionId[:8], "err", err)
 			return
 		}
 
@@ -753,15 +759,15 @@ func handleBenchmarkData(raw net.Conn, c *proto.Conn, sess *session.Session, ses
 func listenAgentData(addr, certPath, keyPath, caCertPath string) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("agent tls cert: %v", err)
+		logging.Fatalf("agent tls cert", "err", err)
 	}
 	caCert, err := os.ReadFile(caCertPath)
 	if err != nil {
-		log.Fatalf("agent read ca: %v", err)
+		logging.Fatalf("agent read ca", "err", err)
 	}
 	caPool := x509.NewCertPool()
 	if !caPool.AppendCertsFromPEM(caCert) {
-		log.Fatalf("agent parse ca cert")
+		logging.Fatalf("agent parse ca cert", "err", "pem parse failed")
 	}
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -776,14 +782,14 @@ func listenAgentData(addr, certPath, keyPath, caCertPath string) {
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("agent listen: %v", err)
+		logging.Fatalf("agent listen", "err", err)
 	}
-	log.Printf("agent plane (QUIC mTLS) слушает %s", addr)
+	slog.Info("agent plane (QUIC mTLS) слушает", "addr", addr)
 
 	for {
 		qconn, err := ln.Accept(context.Background())
 		if err != nil {
-			log.Printf("agent accept: %v", err)
+			slog.Error("agent accept", "err", err)
 			continue
 		}
 		go handleAgentConn(qconn)
@@ -793,7 +799,7 @@ func listenAgentData(addr, certPath, keyPath, caCertPath string) {
 func handleAgentConn(qconn *quic.Conn) {
 	ctrlStream, err := qconn.AcceptStream(context.Background())
 	if err != nil {
-		log.Printf("agent: accept ctrl stream: %v", err)
+		slog.Error("agent: accept ctrl stream", "err", err)
 		qconn.CloseWithError(0, "no ctrl stream")
 		return
 	}
@@ -813,9 +819,9 @@ func handleAgentConn(qconn *quic.Conn) {
 	}
 
 	agent := agentpool.Register(machineID, qconn, ctrl)
-	log.Printf("agent: зарегистрирован %s", machineID)
+	slog.Info("agent: зарегистрирован", "machine_id", machineID)
 
 	<-qconn.Context().Done()
 	agentpool.Unregister(machineID, agent)
-	log.Printf("agent: отключился %s", machineID)
+	slog.Info("agent: отключился", "machine_id", machineID)
 }

@@ -3,7 +3,7 @@ package agentpool
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -51,7 +51,7 @@ func Register(machineID string, qconn *quic.Conn, ctrl *proto.Conn) *Agent {
 
 	mu.Lock()
 	if old, ok := byID[machineID]; ok {
-		log.Printf("agentpool: заменяю предыдущего агента для %s", machineID)
+		slog.Warn("agentpool: заменяю предыдущего агента", "machine_id", machineID)
 		old.qconn.CloseWithError(0, "replaced")
 	}
 	byID[machineID] = a
@@ -87,7 +87,7 @@ func (a *Agent) dispatchLoop() {
 	for {
 		stream, err := a.qconn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("agentpool[%s]: dispatch loop завершён: %v", a.MachineID, err)
+			slog.Warn("agentpool: dispatch loop завершён", "machine_id", a.MachineID, "err", err)
 			return
 		}
 		go a.handleIncomingStream(stream)
@@ -100,8 +100,7 @@ func (a *Agent) handleIncomingStream(s *quic.Stream) {
 
 	msgType, args, err := pc.Recv()
 	if err != nil || msgType != proto.MsgSession || len(args) < 2 {
-		log.Printf("agentpool[%s]: некорректный стрим при открытии: %v %v err=%v",
-			a.MachineID, msgType, args, err)
+		slog.Error("agentpool: некорректный стрим при открытии", "machine_id", a.MachineID, "msg_type", msgType, "args", args, "err", err)
 		s.CancelRead(0)
 		s.CancelWrite(0)
 		return
@@ -111,7 +110,7 @@ func (a *Agent) handleIncomingStream(s *quic.Stream) {
 	idx := 0
 	if purpose == PurposeBridge {
 		if len(args) < 3 {
-			log.Printf("agentpool[%s]: bridge-стрим без индекса канала", a.MachineID)
+			slog.Error("agentpool: bridge-стрим без индекса канала", "machine_id", a.MachineID)
 			s.CancelRead(0)
 			s.CancelWrite(0)
 			return
@@ -119,7 +118,7 @@ func (a *Agent) handleIncomingStream(s *quic.Stream) {
 		var err error
 		idx, err = strconv.Atoi(args[2])
 		if err != nil || idx < 0 || idx >= bridge.ChannelCount {
-			log.Printf("agentpool[%s]: некорректный индекс канала %q", a.MachineID, args[2])
+			slog.Error("agentpool: некорректный индекс канала", "machine_id", a.MachineID, "channel_index", args[2])
 			s.CancelRead(0)
 			s.CancelWrite(0)
 			return

@@ -2,9 +2,10 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 
 	enrollClient "rdp_zero_trust/internal/enrollment/client"
+	"rdp_zero_trust/internal/logging"
 )
 
 func main() {
@@ -14,27 +15,31 @@ func main() {
 	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")
 	certPath := flag.String("cert", "certs/client_cert.crt", "куда сохранить сертификат")
 	keyPath := flag.String("key", "certs/client_key.key", "куда сохранить приватный ключ")
+	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
 
-	log.Printf("генерируем ключевую пару для %s...", *username)
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
+
+	slog.Info("генерируем ключевую пару", "username", *username)
 
 	// Ключ генерируется локально и сохраняется в keyPath
 	// На сервер уходит только CSR (публичная часть)
 	csrPEM, err := enrollClient.GenerateKeyAndCSR(*username, *keyPath)
 	if err != nil {
-		log.Fatalf("generate key/CSR: %v", err)
+		logging.Fatalf("generate key/CSR", "err", err)
 	}
-	log.Printf("ключ сохранён в %s, CSR сформирован", *keyPath)
+	slog.Info("ключ сохранён, CSR сформирован", "key_path", *keyPath)
 
 	// Первичная аутентификация через пароль
 	auth := enrollClient.NewPasswordAuth(*username, *password)
 
-	log.Printf("отправляем CSR на сервер %s...", *serverAddr)
+	slog.Info("отправляем CSR на сервер", "server", *serverAddr)
 	if err := enrollClient.Enroll(*serverAddr, *caPath, *certPath, auth, csrPEM); err != nil {
-		log.Fatalf("enrollment: %v", err)
+		logging.Fatalf("enrollment", "err", err)
 	}
 
-	log.Printf("готово! сертификат сохранён в %s", *certPath)
-	log.Printf("теперь запускай клиент с флагами:")
-	log.Printf("  -cert %s -key %s", *certPath, *keyPath)
+	slog.Info("готово! сертификат сохранён", "cert_path", *certPath)
+	slog.Info("теперь запускай клиент с флагами", "cert", *certPath, "key", *keyPath)
 }

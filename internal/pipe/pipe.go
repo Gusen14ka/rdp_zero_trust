@@ -2,7 +2,7 @@ package pipe
 
 import (
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -58,9 +58,9 @@ func PipeWithDone(a, b net.Conn, done <-chan struct{}) (errAB, errBA error) {
 	go func() {
 		_, err := io.Copy(b, a)
 		if err != nil {
-			log.Printf("pipe: %s -> %s copy error: %v", a.RemoteAddr(), b.RemoteAddr(), err)
+			slog.Error("pipe: copy error", "from", a.RemoteAddr(), "to", b.RemoteAddr(), "err", err)
 		} else {
-			log.Printf("pipe: %s -> %s copy finished", a.RemoteAddr(), b.RemoteAddr())
+			slog.Debug("pipe: copy finished", "from", a.RemoteAddr(), "to", b.RemoteAddr())
 		}
 		closeWrite(b)
 		errCh <- err
@@ -69,9 +69,9 @@ func PipeWithDone(a, b net.Conn, done <-chan struct{}) (errAB, errBA error) {
 	go func() {
 		_, err := io.Copy(a, b)
 		if err != nil {
-			log.Printf("pipe: %s <- %s copy error: %v", a.RemoteAddr(), b.RemoteAddr(), err)
+			slog.Debug("pipe: copy error", "from", b.RemoteAddr(), "to", a.RemoteAddr(), "err", err)
 		} else {
-			log.Printf("pipe: %s <- %s copy finished", a.RemoteAddr(), b.RemoteAddr())
+			slog.Debug("pipe: copy finished", "from", b.RemoteAddr(), "to", a.RemoteAddr())
 		}
 		closeWrite(a)
 		errCh <- err

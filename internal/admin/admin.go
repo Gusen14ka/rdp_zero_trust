@@ -2,11 +2,12 @@ package admin
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/session"
 )
@@ -33,9 +34,9 @@ func (s *Server) Start(addr string) {
 	mux.HandleFunc("DELETE /users/{username}/sessions", s.deleteUserSessions)
 	mux.HandleFunc("GET /sessions/{id}/metrics", s.getMetrics)
 
-	log.Printf("admin HTTP слушает %s", addr)
+	slog.Info("admin HTTP слушает", "addr", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("admin: %v", err)
+		logging.Fatalf("admin", "err", err)
 	}
 }
 
@@ -54,7 +55,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessions.Delete(id)
-	log.Printf("admib: сессия %s принудительно завершена", id)
+	slog.Info("admib: сессия принудительно завершена", "session_id", id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -76,7 +77,7 @@ func (s *Server) deleteUserSessions(w http.ResponseWriter, r *http.Request) {
 		s.sessions.Delete(sess.ID)
 	}
 
-	log.Printf("admin: завершено %d сессий пользователя %s", len(userSessions), username)
+	slog.Info("admin: завершены сессии пользователя", "username", username, "count", len(userSessions))
 	w.WriteHeader(http.StatusNoContent)
 }
 

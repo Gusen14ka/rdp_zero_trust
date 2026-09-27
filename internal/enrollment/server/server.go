@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -78,7 +78,7 @@ func (s *Server) Start(srvAddr, srvCertPath, srvKeyPath string) error {
 		TLSConfig: tlsCfg,
 	}
 
-	log.Printf("enrollment сервер слушает %s", srvAddr)
+	slog.Info("enrollment сервер слушает", "addr", srvAddr)
 	// Используем высокоуровневый ListenAndServeTLS для автоматического обработки HTTP запросов
 	return srv.ListenAndServeTLS("", "")
 }
@@ -100,7 +100,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	// Проверяем credentials — получаем username
 	username, err := handler.Verify(req.Credentials)
 	if err != nil {
-		log.Printf("enrollment auth failed: %v", err)
+		slog.Warn("enrollment auth failed", "err", err)
 		writeError(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -137,12 +137,12 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	// Подписываем сертификат нашим CA
 	certPEM, err := s.signCSR(csr)
 	if err != nil {
-		log.Printf("sign CSR failed for %s: %v", username, err)
+		slog.Error("sign CSR failed", "username", username, "err", err)
 		writeError(w, "signing failed", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("enrollment: выдан сертификат для %s", username)
+	slog.Info("enrollment: выдан сертификат", "username", username)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(api.Response{Certificate: certPEM})
 

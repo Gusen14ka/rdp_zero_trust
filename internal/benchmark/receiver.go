@@ -3,7 +3,7 @@ package benchmark
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -38,7 +38,7 @@ func RunReceiver(ctx context.Context, r io.Reader, m *metrics.StreamMetrics) {
 			if strings.Contains(err.Error(), "use of closed network connection") {
 				return
 			}
-			log.Printf("benchmark receiver: read error: %v", err)
+			slog.Error("benchmark receiver: read error", "err", err)
 			return
 		}
 

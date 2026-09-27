@@ -7,16 +7,25 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"log"
+	"flag"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"time"
 
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/saving"
 )
 
 func main() {
+	logLevel := flag.String("log-level", "info", "log level")
+	flag.Parse()
+
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
+
 	// Создаём папку для сертификатов
 	os.MkdirAll("certs", 0755)
 
@@ -24,26 +33,26 @@ func main() {
 	caKey, caCert := generateCA()
 
 	if err := saving.SaveKey("certs/ca.key", caKey); err != nil {
-		log.Fatalf("save CA key: %v", err)
+		logging.Fatalf("save CA key", "err", err)
 	}
 	saveCert("certs/ca.crt", caCert)
-	log.Println("CA сгенерирован")
+	slog.Info("CA сгенерирован")
 
 	// 2. Генерируем сертификат сервера подписанный CA
 	serverKey, serverCert := generateServerCert(caKey, caCert)
 	if err := saving.SaveKey("certs/server.key", serverKey); err != nil {
-		log.Fatalf("save server key: %v", err)
+		logging.Fatalf("save server key", "err", err)
 	}
 	saveCert("certs/server.crt", serverCert)
-	log.Println("Сертификат сервера сгенерирован")
+	slog.Info("Сертификат сервера сгенерирован")
 
-	log.Println("Готово. Файлы в папке certs/")
+	slog.Info("Готово. Файлы в папке certs/")
 }
 
 func generateCA() (*ecdsa.PrivateKey, *x509.Certificate) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatalf("CA key: %v", err)
+		logging.Fatalf("CA key", "err", err)
 	}
 
 	template := &x509.Certificate{
@@ -61,7 +70,7 @@ func generateCA() (*ecdsa.PrivateKey, *x509.Certificate) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
-		log.Fatalf("CA cert: %v", err)
+		logging.Fatalf("CA cert", "err", err)
 	}
 
 	cert, _ := x509.ParseCertificate(certDER)
@@ -71,7 +80,7 @@ func generateCA() (*ecdsa.PrivateKey, *x509.Certificate) {
 func generateServerCert(caKey *ecdsa.PrivateKey, caCert *x509.Certificate) (*ecdsa.PrivateKey, *x509.Certificate) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		log.Fatalf("server key: %v", err)
+		logging.Fatalf("server key", "err", err)
 	}
 
 	template := &x509.Certificate{
@@ -98,7 +107,7 @@ func generateServerCert(caKey *ecdsa.PrivateKey, caCert *x509.Certificate) (*ecd
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
 	if err != nil {
-		log.Fatalf("server cert: %v", err)
+		logging.Fatalf("server cert", "err", err)
 	}
 
 	cert, _ := x509.ParseCertificate(certDER)
@@ -108,7 +117,7 @@ func generateServerCert(caKey *ecdsa.PrivateKey, caCert *x509.Certificate) (*ecd
 func saveCert(path string, cert *x509.Certificate) {
 	f, err := os.Create(path)
 	if err != nil {
-		log.Fatalf("create cert file: %v", err)
+		logging.Fatalf("create cert file", "err", err)
 	}
 	defer f.Close()
 	pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})

@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -90,7 +90,7 @@ func ListenAll() ([]net.Conn, error) {
 			return conns, fmt.Errorf("listen %s: %w", path, err)
 		}
 		listeners[i] = ln
-		log.Printf("bridge: слушаем канал %s", ChannelNames[i])
+		slog.Info("bridge: слушаем канал", "channel name", ChannelNames[i])
 	}
 
 	// Принимаем подключения
@@ -101,7 +101,7 @@ func ListenAll() ([]net.Conn, error) {
 		}
 		conns[i] = conn
 		listeners[i].Close()
-		log.Printf("bridge: канал %s подключён", ChannelNames[i])
+		slog.Info("bridge: канал подключён", "channel name", ChannelNames[i])
 	}
 
 	return conns, nil
@@ -125,7 +125,7 @@ func BindAll() ([]net.Listener, error) {
 			return nil, fmt.Errorf("listen %s: %w", path, err)
 		}
 		listeners[i] = ln
-		log.Printf("bridge: слушаем канал %s", ChannelNames[i])
+		slog.Info("bridge: слушаем канал", "channel name", ChannelNames[i])
 	}
 	return listeners, nil
 }
@@ -140,7 +140,7 @@ func AcceptAll(listeners []net.Listener) ([]net.Conn, error) {
 		}
 		conns[i] = conn
 		listeners[i].Close()
-		log.Printf("bridge: канал %s подключён", ChannelNames[i])
+		slog.Info("bridge: канал %s подключён", "channel name", ChannelNames[i])
 	}
 	return conns, nil
 }
@@ -152,20 +152,20 @@ func forwardPDUs(wg *sync.WaitGroup, src io.Reader, dst io.Writer,
 	for {
 		pdu, err := ReadPDU(src)
 		if err != nil {
-			log.Printf("[%s] read: %v", name, err)
+			slog.Error(fmt.Sprintf("[%s] read: %v", name, err))
 			return
 		}
 
 		if err := WritePDU(dst, pdu); err != nil {
-			log.Printf("[%s] write: %v", name, err)
+			slog.Error(fmt.Sprintf("[%s] write: %v", name, err))
 			return
 		}
 
-		log.Printf("[%s] %s %d bytes",
+		slog.Debug(fmt.Sprintf("[%s] %s %d bytes",
 			name,
 			direction,
 			len(pdu),
-		)
+		))
 	}
 }
 
@@ -199,6 +199,6 @@ func BridgeChannels(
 		)
 	}
 
-	log.Printf("все каналы запущены")
+	slog.Info("все каналы запущены")
 	wg.Wait()
 }

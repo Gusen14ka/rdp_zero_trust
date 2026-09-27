@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,13 +18,11 @@ import (
 	"rdp_zero_trust/internal/benchmark"
 	"rdp_zero_trust/internal/benchproto"
 	"rdp_zero_trust/internal/loading"
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/metrics"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
-
-	"crypto/tls"
-	"net"
 
 	"github.com/quic-go/quic-go"
 )
@@ -41,6 +41,7 @@ func main() {
 	scenario := flag.String("scenario", "baseline", "название сценария для лога")
 	transport := flag.String("transport", "tcp", "транспорт: tcp или quic")
 	outPath := flag.String("out", "result.json", "путь для сохранения результата")
+	logLevel := flag.String("log-level", "info", "log level")
 	// Параметры сетевой эмуляции
 	lossPct := flag.Float64("loss", 0, "потери пакетов в процентах")
 	delayMs := flag.Int("delay", 0, "задержка в миллисекундах")
@@ -48,17 +49,18 @@ func main() {
 	rateMbit := flag.Float64("rate", 0, "ограничение bandwidth в Mbit/s")
 	flag.Parse()
 
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
+
 	// Выбираем паттерн
 	pat, err := selectPattern(*patternStr)
 	if err != nil {
-		log.Fatalf("паттерн: %v", err)
+		logging.Fatalf("паттерн", "err", err)
 	}
 
-	log.Printf("=== Benchmark ===")
-	log.Printf("паттерн:   %s", pat.Name)
-	log.Printf("транспорт: %s", *transport)
-	log.Printf("сценарий:  %s", *scenario)
-	log.Printf("длительность: %v", pat.Duration)
+	slog.Info("=== Benchmark ===")
+	slog.Info("bench setup", "pattern", pat.Name, "transport", *transport, "scenario", *scenario, "duration", pat.Duration)
 
 	benchParams := benchproto.BenchParams{
 		LossPct:          *lossPct,
@@ -74,18 +76,18 @@ func main() {
 		*caPath, *certPath, *keyPath, benchParams,
 	)
 	if err != nil {
-		log.Fatalf("auth: %v", err)
+		logging.Fatalf("auth", "err", err)
 	}
 	defer ctrlConn.Close()
-	log.Printf("сессия: %s", sessionID)
+	slog.Info("сессия создана", "session_id", sessionID)
 
 	// Шаг 2: data plane соединение
 	dataConn, err := connectData(*transport, *dataAddr, *quicAddr, *caPath, sessionID)
 	if err != nil {
-		log.Fatalf("data plane: %v", err)
+		logging.Fatalf("data plane", "err", err)
 	}
 	defer dataConn.Close()
-	log.Printf("data plane подключён (%s)", *transport)
+	slog.Info("data plane подключён", "transport", *transport)
 
 	// Шаг 3: запускаем benchmark
 	startedAt := time.Now()
@@ -106,22 +108,19 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Printf("sender старт: %d байт каждые %v",
-			pat.ClientPacketSize, pat.ClientPacketInterval)
+		slog.Info("sender старт", "packet_size", pat.ClientPacketSize, "interval", pat.ClientPacketInterval)
 		sentResult = benchmark.RunSender(ctx, dataConn,
 			pat.ClientPacketSize, pat.ClientPacketInterval)
-		log.Printf("sender завершён: отправлено %d пакетов", sentResult.PacketsSent)
-		// Sender завершён — закрываем соединение чтобы разблокировать receiver
-		dataConn.Close()
+		slog.Info("sender завершён", "packets_sent", sentResult.PacketsSent)
 	}()
 
 	// Направление server → client (echo): считаем RTT
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Printf("receiver старт (RTT)")
+		slog.Info("receiver старт (RTT)")
 		benchmark.RunReceiver(ctx, dataConn, clientMetrics)
-		log.Printf("receiver завершён: получено %d echo", clientMetrics.PacketsReceived)
+		slog.Info("receiver завершён", "packets_received", clientMetrics.PacketsReceived)
 	}()
 
 	wg.Wait()
@@ -131,7 +130,7 @@ func main() {
 	//dataConn.Close()
 
 	actualDuration := time.Since(startedAt)
-	log.Printf("benchmark завершён за %v", actualDuration)
+	slog.Info("benchmark завершён", "duration", actualDuration)
 
 	// Шаг 4: получаем серверные метрики через admin API
 	// log.Printf("получаем метрики с сервера...")
@@ -153,11 +152,11 @@ func main() {
 	}
 	// Создаём папку если не существует
 	if err := os.MkdirAll(filepath.Dir(*outPath), 0755); err != nil {
-		log.Fatalf("mkdir: %v", err)
+		logging.Fatalf("mkdir", "err", err)
 	}
 
 	if err := result.Save(*outPath); err != nil {
-		log.Fatalf("save result: %v", err)
+		logging.Fatalf("save result", "err", err)
 	}
 
 	// Печатаем краткую сводку

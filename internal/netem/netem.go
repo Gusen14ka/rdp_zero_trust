@@ -2,7 +2,7 @@ package netem
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os/exec"
 	"strings"
 )
@@ -24,12 +24,12 @@ func (c *Controller) Apply(params NetParams) error {
 	// Сначала сбрасываем предыдущие правила
 	if err := c.reset(); err != nil {
 		// Игнорируем ошибку — правил могло не быть
-		log.Printf("netem reset (ignored): %v", err)
+		slog.Debug("netem reset (ignored)", "err", err)
 	}
 
 	// Если все параметры нулевые — просто сбрасываем
 	if params.IsEmpty() {
-		log.Printf("netem: сеть без ограничений")
+		slog.Info("netem: сеть без ограничений")
 		return nil
 	}
 
@@ -39,14 +39,14 @@ func (c *Controller) Apply(params NetParams) error {
 		return fmt.Errorf("build tc args: %w", err)
 	}
 
-	log.Printf("netem: применяем %s", strings.Join(args, " "))
+	slog.Info("netem: применяем", "args", strings.Join(args, " "))
 	cmd := exec.Command("sudo", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tc: %w, output: %s", err, out)
 	}
 
-	log.Printf("netem: применено успешно")
+	slog.Info("netem: применено успешно")
 	return nil
 }
 
@@ -60,9 +60,9 @@ func (c *Controller) Reset() error {
 		"root", "fq_codel")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("netem: не удалось восстановить fq_codel: %s", out)
+		slog.Error("netem: не удалось восстановить fq_codel", "output", string(out))
 	} else {
-		log.Printf("netem: fq_codel восстановлен")
+		slog.Info("netem: fq_codel восстановлен")
 	}
 	return nil
 }
@@ -115,7 +115,7 @@ func (c *Controller) buildArgs(params NetParams) ([]string, error) {
 	if hasNetem && hasRate {
 		// Комбо — пока применяем только netem, rate добавим позже
 		// TODO: иерархия tbf → netem для одновременного применения
-		log.Printf("netem: WARNING — bandwidth ограничение игнорируется при наличии netem параметров")
+		slog.Warn("netem: bandwidth ограничение игнорируется при наличии netem параметров")
 		return c.buildNetemArgs(params), nil
 	}
 

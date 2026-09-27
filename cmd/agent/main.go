@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -13,6 +13,7 @@ import (
 
 	"rdp_zero_trust/internal/bridge"
 	"rdp_zero_trust/internal/loading"
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -30,11 +31,16 @@ func main() {
 	caPath := flag.String("ca", "certs/ca.crt", "корневой сертификат CA")
 	certPath := flag.String("cert", "certs/agent_cert.crt", "сертификат агента")
 	keyPath := flag.String("key", "certs/agent_key.key", "приватный ключ агента")
+	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
+
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
 
 	for {
 		if err := run(*serverAddr, *machineID, *pfServerAddr, *caPath, *certPath, *keyPath); err != nil {
-			log.Printf("agent: соединение оборвалось: %v, переподключение через 5с", err)
+			slog.Warn("agent: соединение оборвалось, переподключение через 5с", "err", err)
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -68,11 +74,11 @@ func run(serverAddr, machineID, pfServerAddr, caPath, certPath, keyPath string) 
 	msgType, args, err := ctrl.Recv()
 	if err != nil || msgType != proto.MsgOK {
 		if len(args) > 0 {
-			log.Printf("agent: сервер отклонил регистрацию: %s", args[0])
+			slog.Error("agent: сервер отклонил регистрацию", "machine_id", machineID, "arg", args[0])
 		}
 		return err
 	}
-	log.Printf("agent: зарегистрирован как %s, жду запросов от сервера...", machineID)
+	slog.Info("agent: зарегистрирован, жду запросов от сервера...", "machine_id", machineID)
 
 	for {
 		msgType, args, err := ctrl.Recv()
@@ -80,7 +86,7 @@ func run(serverAddr, machineID, pfServerAddr, caPath, certPath, keyPath string) 
 			return err
 		}
 		if len(args) == 0 {
-			log.Printf("agent: сообщение без sessionID: %s", msgType)
+			slog.Error("agent: сообщение без sessionID", "msg_type", msgType)
 			continue
 		}
 		sessionID := args[0]
@@ -91,7 +97,7 @@ func run(serverAddr, machineID, pfServerAddr, caPath, certPath, keyPath string) 
 		case proto.MsgOpenBridge:
 			go handleBridge(qconn, sessionID)
 		default:
-			log.Printf("agent: неожиданное сообщение: %s %v", msgType, args)
+			slog.Error("agent: неожиданное сообщение", "msg_type", msgType, "args", args)
 		}
 	}
 }
@@ -105,7 +111,7 @@ func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
 	// иначе хук падает и pf_server рвёт сессию.
 	listeners, err := bridge.BindAll()
 	if err != nil {
-		log.Printf("agent: [%s] bind unix: %v", sessionID[:8], err)
+		slog.Error("agent: bind unix", "session_id", sessionID[:8], "err", err)
 		return
 	}
 
@@ -117,17 +123,17 @@ func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
 	go func() {
 		conns, err := bridge.AcceptAll(listeners)
 		if err != nil {
-			log.Printf("agent: [%s] accept unix: %v", sessionID[:8], err)
+			slog.Error("agent: accept unix", "session_id", sessionID[:8], "err", err)
 			return
 		}
-		log.Printf("agent: [%s] quicmux подключился ко всем каналам", sessionID[:8])
+		slog.Info("agent: quicmux подключился ко всем каналам", "session_id", sessionID[:8])
 		connsCh <- conns
 	}()
 
-	log.Printf("agent: [%s] фаза 1 — дозваниваюсь до pf_server %s", sessionID[:8], pfServerAddr)
+	slog.Info("agent: фаза 1 — дозваниваюсь до pf_server", "session_id", sessionID[:8], "pf_server", pfServerAddr)
 	target, err := net.Dial("tcp", pfServerAddr)
 	if err != nil {
-		log.Printf("agent: [%s] не могу подключиться к pf_server: %v", sessionID[:8], err)
+		slog.Error("agent: не могу подключиться к pf_server", "session_id", sessionID[:8], "pf_server", pfServerAddr, "err", err)
 		return
 	}
 	defer target.Close()
@@ -135,23 +141,23 @@ func handleRelay(qconn *quic.Conn, pfServerAddr, sessionID string) {
 
 	stream, err := qconn.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Printf("agent: [%s] open relay stream: %v", sessionID[:8], err)
+		slog.Error("agent: open relay stream", "session_id", sessionID[:8], "err", err)
 		return
 	}
 
 	sc := quicconn.New(qconn, stream)
 	pc := proto.NewConn(sc)
 	if err := pc.Send(proto.MsgSession, sessionID, "relay"); err != nil {
-		log.Printf("agent: [%s] handshake relay-стрима: %v", sessionID[:8], err)
+		slog.Error("agent: handshake relay-стрима", "session_id", sessionID[:8], "err", err)
 		return
 	}
 	if msgType, _, err := pc.Recv(); err != nil || msgType != proto.MsgOK {
-		log.Printf("agent: [%s] сервер не подтвердил relay-стрим: %v", sessionID[:8], err)
+		slog.Error("agent: сервер не подтвердил relay-стрим", "session_id", sessionID[:8], "err", err)
 		return
 	}
 
 	err1, err2 := pipe.Pipe(sc, target)
-	log.Printf("agent: [%s] фаза 1 завершена err1=%v err2=%v", sessionID[:8], err1, err2)
+	slog.Info("agent: фаза 1 завершена", "session_id", sessionID[:8], "err1", err1, "err2", err2)
 }
 
 // handleBridge — фаза 2: поднимает unix-мост (сюда стучится quicmux) и
@@ -163,7 +169,7 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 	sessionsMu.Unlock()
 
 	if !ok {
-		log.Printf("agent: [%s] нет подготовленных unix-каналов", sessionID[:8])
+		slog.Error("agent: нет подготовленных unix-каналов", "session_id", sessionID[:8])
 		return
 	}
 
@@ -171,7 +177,7 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 	select {
 	case unixConns = <-connsCh:
 	case <-time.After(10 * time.Second):
-		log.Printf("agent: [%s] таймаут ожидания подключения quicmux", sessionID[:8])
+		slog.Error("agent: таймаут ожидания подключения quicmux", "session_id", sessionID[:8])
 		return
 	}
 	defer func() {
@@ -180,28 +186,28 @@ func handleBridge(qconn *quic.Conn, sessionID string) {
 		}
 	}()
 
-	log.Printf("agent: [%s] фаза 2 — открываю QUIC-стримы", sessionID[:8])
+	slog.Info("agent: фаза 2 — открываю QUIC-стримы", "session_id", sessionID[:8])
 
 	quicStreams := make([]*quic.Stream, bridge.ChannelCount)
 	for i := 0; i < bridge.ChannelCount; i++ {
 		stream, err := qconn.OpenStreamSync(context.Background())
 		if err != nil {
-			log.Printf("agent: [%s] open stream %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
+			slog.Error("agent: open stream", "session_id", sessionID[:8], "channel", bridge.ChannelNames[i], "err", err)
 			return
 		}
 
 		pc := proto.NewConn(quicconn.New(qconn, stream))
 		if err := pc.Send(proto.MsgSession, sessionID, "bridge", strconv.Itoa(i)); err != nil {
-			log.Printf("agent: [%s] handshake на стриме %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
+			slog.Error("agent: handshake на стриме", "session_id", sessionID[:8], "channel", bridge.ChannelNames[i], "err", err)
 			return
 		}
 		if msgType, _, err := pc.Recv(); err != nil || msgType != proto.MsgOK {
-			log.Printf("agent: [%s] сервер не подтвердил стрим %s: %v", sessionID[:8], bridge.ChannelNames[i], err)
+			slog.Error("agent: сервер не подтвердил стрим", "session_id", sessionID[:8], "channel", bridge.ChannelNames[i], "err", err)
 			return
 		}
 		quicStreams[i] = stream
 	}
 
 	bridge.BridgeChannels(unixConns, quicStreams)
-	log.Printf("agent: [%s] мост завершён", sessionID[:8])
+	slog.Info("agent: мост завершён", "session_id", sessionID[:8])
 }

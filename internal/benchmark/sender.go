@@ -3,9 +3,10 @@ package benchmark
 import (
 	"context"
 	"io"
-	"log"
-	"rdp_zero_trust/internal/benchproto"
+	"log/slog"
 	"time"
+
+	"rdp_zero_trust/internal/benchproto"
 )
 
 type SenderResult struct {
@@ -35,11 +36,11 @@ func RunSender(ctx context.Context, w io.Writer, packetSize int, interval time.D
 		case <-ticker.C:
 			_, err := WritePacket(w, packetSize)
 			if err != nil {
-				log.Printf("benchmark sender: write error: %v", err)
+				slog.Warn("benchmark sender: write error", "err", err)
 				result.Errors++
 				// Не выходим сразу — считаем ошибки как потери
 				if result.Errors > 10 {
-					log.Printf("benchmark sender: слишком много ошибок, выходим")
+					slog.Error("benchmark sender: слишком много ошибок, выходим")
 					return result
 				}
 				continue

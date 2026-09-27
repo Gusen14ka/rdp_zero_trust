@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -14,6 +14,7 @@ import (
 
 	"rdp_zero_trust/internal/bridge"
 	"rdp_zero_trust/internal/loading"
+	"rdp_zero_trust/internal/logging"
 	"rdp_zero_trust/internal/pipe"
 	"rdp_zero_trust/internal/proto"
 	"rdp_zero_trust/internal/quicconn"
@@ -34,15 +35,21 @@ func main() {
 	clientKeyPath := flag.String("key", "certs/client_key.key", "приватный ключ клиента")
 	transport := flag.String("transport", "tcp", "транспорт data plane: tcp или quic")
 	mode := flag.String("mode", "freerdp", "режим работы: mstsc или freerdp")
+	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
+
+	//Настриваем логгер
+	if err := logging.Configure(*logLevel); err != nil {
+		logging.Fatalf("failed to configure logger", "err", err)
+	}
 
 	// Шаг 1: control plane — аутентификация и запрос машины
 	sessionId, err := authenticate(*serverAddr, *username, *password, *machineId,
 		*caPath, *clientCertPath, *clientKeyPath, *mode)
 	if err != nil {
-		log.Fatalf("auth: %v", err)
+		logging.Fatalf("auth:", "err", err)
 	}
-	log.Printf("сессия получена: %s", sessionId)
+	slog.Info("Сессия получена:", "sessionId", sessionId)
 
 	switch *mode {
 	case "mstsc":
@@ -55,13 +62,13 @@ func main() {
 
 // Реализация пайплайна с подключением в freerdp
 func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
-	log.Printf("режим freerdp: ждём подключения xfreerdp-quic...")
+	slog.Info("режим freerdp: ждём подключения xfreerdp-quic...")
 
 	// TODO: 2 и 3 шаги вынести в отдельную функцию и объединить с tunnelQUIC
 	// Шаг 2: устанавливаем QUIC соединение с сервером
 	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
-		log.Fatalf("tls config: %v", err)
+		logging.Fatalf("tls config:", "err", err)
 	}
 	tlsCfg.NextProtos = []string{"rdp-zero-trust"}
 
@@ -70,14 +77,14 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
-		log.Fatalf("quic dial: %v", err)
+		logging.Fatalf("quic dial:", "err", err)
 	}
 	defer conn.CloseWithError(0, "done")
 
 	// Шаг 3: SESSION handshake на контрольном стриме (стрим 0)
 	ctrlStream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Fatalf("open ctrl stream: %v", err)
+		logging.Fatalf("open ctrl stream:", "err", err)
 	}
 	qctrl := quicconn.New(conn, ctrlStream)
 	c := proto.NewConn(qctrl)
@@ -85,11 +92,11 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK {
 		if len(args) > 0 {
-			log.Fatalf("сервер отклонил: %s", args[0])
+			logging.Fatalf("сервер отклонил:", "args", args[0])
 		}
-		log.Fatalf("handshake failed: %v", err)
+		logging.Fatalf("handshake failed:", "err", args[0])
 	}
-	log.Printf("сессия подтвержден")
+	slog.Info("сессия подтверждена")
 
 	// ВАЖНО: xfreerdp-quic подключается к unix-сокетам в СВОЁМ PreConnect —
 	// то есть ДО того как вообще попытается дозвониться по TCP на /v:.
@@ -97,14 +104,14 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	// а не после него.
 	unixConns, err := bridge.ListenAll()
 	if err != nil {
-		log.Fatalf("bridge listen: %v", err)
+		logging.Fatalf("bridge listen:", "err", err)
 	}
 	defer func() {
 		for _, uc := range unixConns {
 			uc.Close()
 		}
 	}()
-	log.Printf("все 4 unix-канала подключены (xfreerdp-quic прошёл PreConnect)")
+	slog.Info("все 4 unix-канала подключены (xfreerdp-quic прошёл PreConnect)")
 
 	// Ждём, пока сервер прогреет relay до pf_server — только после этого
 	// открываем локальный порт, чтобы xfreerdp-quic коннектился уже в
@@ -112,30 +119,30 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	msgType, args, err = c.Recv()
 	if err != nil || msgType != proto.MsgRelayReady {
 		if len(args) > 0 {
-			log.Fatalf("сервер отклонил relay: %s", args[0])
+			logging.Fatalf("сервер отклонил relay:", "arg", args[0])
 		}
-		log.Fatalf("не дождались RELAY_READY: %v", err)
+		logging.Fatalf("не дождались RELAY_READY:", "err", err)
 	}
-	log.Printf("relay-плечо на сервере готово")
+	slog.Info("relay-плечо на сервере готово")
 
 	// Фаза 1: теперь начинается по-настоящему — открываем
 	// локальный TCP listener, на который xfreerdp-quic будет дозваниваться
 	// как на свой /v:-адрес (это следующий шаг FreeRDP после PreConnect).
 	relayStream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Fatalf("open relay stream: %v", err)
+		logging.Fatalf("open relay stream:", "err", err)
 	}
 
 	ln, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		log.Fatalf("local listen: %v", err)
+		logging.Fatalf("local listen:", "err", err)
 	}
-	log.Printf("слушаю %s — сюда должен стучаться xfreerdp-quic (/v:%s)", localAddr, localAddr)
+	slog.Info("слушаю %s — сюда должен стучаться xfreerdp-quic (/v:%s)", localAddr, localAddr)
 
 	local, err := ln.Accept()
 	ln.Close()
 	if err != nil {
-		log.Fatalf("accept from xfreerdp-quic: %v", err)
+		logging.Fatalf("accept from xfreerdp-quic:", "err", err)
 	}
 
 	relayDone := make(chan struct{})
@@ -143,22 +150,22 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	go func() {
 		defer close(relayDone)
 		relayCopyLocalOnly(relayStreamPConn, local)
-		log.Printf("фаза 1 relay (клиентская сторона) завершена")
+		slog.Info("фаза 1 relay (клиентская сторона) завершена")
 	}()
 
 	// Настоящий сигнал переключения — не факт подключения unix-сокетов
 	// (это уже случилось раньше), а маркер READY, который PostConnect
 	// у xfreerdp-quic шлёт через control-канал, когда хуки транспорта
 	// реально встали.
-	log.Printf("жду READY маркер от xfreerdp-quic (PostConnect)...")
+	slog.Info("жду READY маркер от xfreerdp-quic (PostConnect)...")
 	marker, err := bridge.ReadPDU(unixConns[bridge.ChannelControl])
 	if err != nil {
-		log.Fatalf("не дождались READY маркера: %v", err)
+		logging.Fatalf("не дождались READY маркера:", "err", err)
 	}
 	if string(marker) != "QUICMUX_READY" {
-		log.Fatalf("неожиданный маркер вместо READY: %q", marker)
+		logging.Fatalf("неожиданный маркер вместо READY:", "marker", marker)
 	}
-	log.Printf("получен READY, останавливаю фазу 1")
+	slog.Info("получен READY, останавливаю фазу 1")
 
 	//local.Close()
 	// local НЕ закрываем: EOF сделал бы TCP-сокет у xfreerdp-quic
@@ -170,7 +177,10 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	c.Send(proto.MsgSwitchChannels)
 	msgType, args, err = c.Recv()
 	if err != nil || msgType != proto.MsgOK {
-		log.Fatalf("сервер не подтвердил переключение: %v %v %v", msgType, args, err)
+		logging.Fatalf("сервер не подтвердил переключение:",
+			"msgType", msgType,
+			"args", args,
+			"err", err)
 	}
 
 	// Шаг 4: открываем отдельный QUIC стрим для каждого канала
@@ -178,7 +188,9 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 	for i := 0; i < bridge.ChannelCount; i++ {
 		stream, err := conn.OpenStreamSync(context.Background())
 		if err != nil {
-			log.Fatalf("open stream %s: %v", bridge.ChannelNames[i], err)
+			logging.Fatalf("open stream:",
+				"channel name", bridge.ChannelNames[i],
+				"err", err)
 		}
 
 		// Обязательно пишем хендшейк СРАЗУ: пока по стриму не ушёл первый байт,
@@ -186,20 +198,26 @@ func runFreerdpMode(localAddr, dataAddr, sessionID, caPath string) {
 		// и весь мост встанет намертво.
 		pc := proto.NewConn(quicconn.New(conn, stream))
 		if err := pc.Send(proto.MsgSession, sessionID, "bridge", strconv.Itoa(i)); err != nil {
-			log.Fatalf("handshake стрима %s: %v", bridge.ChannelNames[i], err)
+			logging.Fatalf("handshake стрима ",
+				"channel name", bridge.ChannelNames[i],
+				"err", err)
 		}
 		msgType, _, err := pc.Recv()
 		if err != nil || msgType != proto.MsgOK {
-			log.Fatalf("сервер не подтвердил стрим %s: %v", bridge.ChannelNames[i], err)
+			logging.Fatalf("сервер не подтвердил стрим",
+				"channel name", bridge.ChannelNames[i],
+				"err", err)
 		}
 
 		quicStreams[i] = stream
-		log.Printf("стрим %s открыт и подтверждён (id=%d)", bridge.ChannelNames[i], stream.StreamID())
+		slog.Info("стрим открыт и подтверждён",
+			"channel name", bridge.ChannelNames[i],
+			"stream id", stream.StreamID())
 	}
 
 	// Шаг 5: для каждого канала запускаем пересылку в обе стороны
 	bridge.BridgeChannels(unixConns, quicStreams)
-	log.Printf("runFreerdpMode завершён")
+	slog.Info("runFreerdpMode завершён")
 }
 
 // Релизация пайплайна с подключением в mstsc
@@ -207,14 +225,14 @@ func runMstscMode(localAddr, dataAddr, transport, sessionId, caPath string) {
 	// Шаг 2: поднимаем локальный listener для mstsc
 	ln, err := net.Listen("tcp", localAddr)
 	if err != nil {
-		log.Fatalf("local listen: %v", err)
+		logging.Fatalf("local listen:", "err", err)
 	}
-	log.Printf("слушаем на %s — открывай mstsc на этот адрес", localAddr)
+	slog.Info(fmt.Sprintf("слушаем на %s — открывай mstsc на этот адрес", localAddr))
 
 	for {
 		local, err := ln.Accept()
 		if err != nil {
-			log.Printf("local accept: %v", err)
+			slog.Warn("local accept:", "err", err)
 			continue
 		}
 
@@ -286,10 +304,10 @@ func authenticate(serverAddr, username, password, machineId, caPath, clientCertP
 		// Ждём сообщения от сервера — это либо истечение TTL либо отзыв
 		msgType, args, err := c.Recv()
 		if err != nil {
-			log.Printf("control: соединение закрыто")
+			slog.Info("control: соединение закрыто")
 		} else if msgType == proto.MsgError && len(args) > 0 {
 			// Сервер прислал причину завершения
-			log.Printf("control: сессия завершена сервером: %s", args[0])
+			slog.Info("control: сессия завершена сервером:", "arg", args[0])
 		}
 		// В продакшне здесь был бы graceful shutdown всех активных туннелей
 		// Пока просто логируем — mstsc сам увидит что соединение пропало
@@ -301,11 +319,11 @@ func authenticate(serverAddr, username, password, machineId, caPath, clientCertP
 // tunnelQUIC — QUIC версия туннеля
 func tunnelQUIC(local net.Conn, quicAddr, sessionId, caPath string) {
 	defer local.Close()
-	log.Printf("tunnel quic: [%s] новое соединение от %s", sessionId[:8], local.RemoteAddr())
+	slog.Info(fmt.Sprintf("tunnel quic: [%s] новое соединение от %s", sessionId[:8], local.RemoteAddr()))
 
 	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
-		log.Printf("tunnel quic: tls config: %v", err)
+		slog.Error("tunnel quic: tls config:", "err", err)
 		return
 	}
 	// ALPN должен совпадать с сервером
@@ -317,7 +335,7 @@ func tunnelQUIC(local net.Conn, quicAddr, sessionId, caPath string) {
 		KeepAlivePeriod: 10 * time.Second,
 	})
 	if err != nil {
-		log.Printf("tunnel quic: dial: %v", err)
+		slog.Error("tunnel quic: dial:", "err", err)
 		return
 	}
 	defer conn.CloseWithError(0, "done")
@@ -325,7 +343,7 @@ func tunnelQUIC(local net.Conn, quicAddr, sessionId, caPath string) {
 	// Открываем стрим внутри QUIC соединения
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Printf("tunnel quic: open stream: %v", err)
+		slog.Error("tunnel quic: open stream:", "err", err)
 		return
 	}
 
@@ -337,34 +355,34 @@ func tunnelQUIC(local net.Conn, quicAddr, sessionId, caPath string) {
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK {
 		if len(args) > 0 {
-			log.Printf("tunnel quic: сервер отклонил: %s", args[0])
+			slog.Error("tunnel quic: сервер отклонил:", "arg", args[0])
 		} else {
-			log.Printf("tunnel quic: ошибка handshake: %v", err)
+			slog.Error("tunnel quic: ошибка handshake:", "err", err)
 		}
 		return
 	}
-	log.Printf("tunnel quic: [%s] старт", sessionId[:8])
+	slog.Info("tunnel quic: старт", "sess id", sessionId[:8])
 
 	tlsCfg.KeyLogWriter = keyLogWriter("quic_keylog.txt")
 
 	err1, err2 := pipe.Pipe(qconn, local)
-	log.Printf("tunnel quic: [%s] завершено err1=%v err2=%v", sessionId[:8], err1, err2)
+	slog.Info(fmt.Sprintf("tunnel quic: [%s] завершено err1=%v err2=%v", sessionId[:8], err1, err2))
 }
 
 // tunnel: принимает соединение от mstsc, пробрасывает через data plane
 func tunnelTCP(local net.Conn, dataAddr, sessionId, caPath string) {
 	defer local.Close()
-	log.Printf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionId[:8], local.RemoteAddr())
+	slog.Info(fmt.Sprintf("tunnel: [%s] НАЧАЛО - новое соединение от %s", sessionId[:8], local.RemoteAddr()))
 
 	tlsCfg, err := loading.LoadTLSConfig(caPath)
 	if err != nil {
-		log.Printf("tunnel: tls config: %v", err)
+		slog.Error("tunnel: tls config:", "err", err)
 	}
 
 	dialer := pipe.NoDelayDialer(10 * time.Second)
 	raw, err := tls.DialWithDialer(dialer, "tcp", dataAddr, tlsCfg)
 	if err != nil {
-		log.Printf("tunnel: dial data plane: %v", err)
+		slog.Error("tunnel: dial data plane:", "err", err)
 		return
 	}
 	defer raw.Close()
@@ -373,32 +391,32 @@ func tunnelTCP(local net.Conn, dataAddr, sessionId, caPath string) {
 	c := proto.NewConn(raw)
 	// Отправляем запрос сессии
 	c.Send(proto.MsgSession, sessionId)
-	log.Printf("tunnel: отправлен SESSION %s", sessionId)
+	slog.Info("tunnel: отправлен sessionId", "id", sessionId)
 
 	// ЖДЁМ ПОДТВЕРЖДЕНИЯ ОТ СЕРВЕРА перед началом передачи RDP данных
 	msgType, args, err := c.Recv()
 	if err != nil || msgType != proto.MsgOK {
 		if msgType == proto.MsgError && len(args) > 0 {
-			log.Printf("tunnel: сервер отклонил: %s", args[0])
+			slog.Error("tunnel: сервер отклонил:", "arg", args[0])
 		} else {
-			log.Printf("tunnel: ошибка handshake: %v", err)
+			slog.Error("tunnel: ошибка handshake:", "err", err)
 		}
 		return
 	}
-	log.Printf("tunnel: [%s] старт", sessionId[:8])
+	slog.Info("tunnel: старт", "sess id", sessionId[:8])
 
 	// Фаза 2: Binary transfer
 	// После handshake буфер reader пуст — передаём raw напрямую
-	log.Printf("tunnel: [%s] старт data transfering", sessionId[:8])
+	slog.Info("tunnel: старт data transfering", "sess id", sessionId[:8])
 	err1, err2 := pipe.Pipe(raw, local)
-	log.Printf("tunnel: [%s] завершено err1=%v err2=%v", sessionId[:8], err1, err2)
+	slog.Info(fmt.Sprintf("tunnel: [%s] завершено err1=%v err2=%v", sessionId[:8], err1, err2))
 }
 
 // Утилита для эксперимента (временно)
 func keyLogWriter(path string) io.Writer {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
-		log.Printf("keylog: %v", err)
+		slog.Error("keylog:", "error", err)
 		return nil
 	}
 	return f

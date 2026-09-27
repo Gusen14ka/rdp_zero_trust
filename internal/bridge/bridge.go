@@ -2,12 +2,14 @@ package bridge
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"sync"
+	"syscall"
 
 	"github.com/quic-go/quic-go"
 )
@@ -152,12 +154,21 @@ func forwardPDUs(wg *sync.WaitGroup, src io.Reader, dst io.Writer,
 	for {
 		pdu, err := ReadPDU(src)
 		if err != nil {
-			slog.Error(fmt.Sprintf("[%s] read: %v", name, err))
+			if isClosedErr(err) {
+				slog.Info("канал закрыт", "channel", name, "dir", direction, "err", err)
+			} else {
+				slog.Error("ошибка канала", "channel", name, "dir", direction, "err", err)
+			}
 			return
 		}
 
-		if err := WritePDU(dst, pdu); err != nil {
-			slog.Error(fmt.Sprintf("[%s] write: %v", name, err))
+		err = WritePDU(dst, pdu)
+		if err != nil {
+			if isClosedErr(err) {
+				slog.Info("канал закрыт", "channel", name, "dir", direction, "err", err)
+			} else {
+				slog.Error("ошибка канала", "channel", name, "dir", direction, "err", err)
+			}
 			return
 		}
 
@@ -201,4 +212,11 @@ func BridgeChannels(
 
 	slog.Info("все каналы запущены")
 	wg.Wait()
+}
+
+func isClosedErr(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE)
 }

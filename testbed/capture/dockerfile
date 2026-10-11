@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# xrdp + xorgxrdp — RDP-сервер и драйвер X для него
+# минимальный XFCE + dbus-x11 — рабочий стол
+# pulseaudio + модуль xrdp — звук в RDP-сессию
+# mpv/ffmpeg/xdotool — плеер и автоматизация сценариев
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      xrdp xorgxrdp \
+      xfce4-session xfwm4 xfce4-panel xfdesktop4 xfce4-terminal xfce4-settings dbus-x11 \
+      pulseaudio pulseaudio-module-xrdp \
+      mpv ffmpeg xdotool sudo ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# пользователь, под которым заходим по RDP; при входе запускается XFCE
+RUN useradd -m -s /bin/bash rdptest && echo 'rdptest:rdptest' | chpasswd \
+ && echo 'xfce4-session' > /home/rdptest/.xsession \
+ && chown rdptest:rdptest /home/rdptest/.xsession
+
+# список версий пакетов — для воспроизводимости в дипломе
+RUN dpkg -l > /versions.txt
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+EXPOSE 3389
+ENTRYPOINT ["/entrypoint.sh"]
